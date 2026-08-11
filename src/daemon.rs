@@ -23,6 +23,11 @@ use crate::{
 };
 
 const STATUS_DAEMON_INTERVAL: Duration = Duration::from_millis(300);
+// With no agent panes there is nothing to debounce and no state to transition —
+// the only event worth noticing is an agent starting, and a ~2s first-badge
+// delay is imperceptible. Polling lazily cuts the daemon's steady-state cost
+// (a tmux subprocess spawn every 300ms) to near zero on agent-free servers.
+const STATUS_DAEMON_IDLE_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_DAEMON_OWNERSHIP_CHECK_POLLS: u32 = 10;
 const STATUS_CAPTURE_LINES: usize = 25;
 /// Consecutive idle polls required before committing a Working/Blocked -> Idle
@@ -73,10 +78,11 @@ pub fn run_status_daemon() -> Result<()> {
         }
         ownership_check = (ownership_check + 1) % STATUS_DAEMON_OWNERSHIP_CHECK_POLLS;
 
-        if poll_agent_status_once(&mut debounce).is_err() {
-            break;
+        match poll_agent_status_once(&mut debounce) {
+            Err(_) => break,
+            Ok(true) => thread::sleep(STATUS_DAEMON_INTERVAL),
+            Ok(false) => thread::sleep(STATUS_DAEMON_IDLE_INTERVAL),
         }
-        thread::sleep(STATUS_DAEMON_INTERVAL);
     }
 
     let _ = tmux_status(Command::new("tmux").args([
@@ -89,7 +95,9 @@ pub fn run_status_daemon() -> Result<()> {
     Ok(())
 }
 
-pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<()> {
+/// Returns whether any pane currently hosts an agent, so the caller can poll
+/// lazily on agent-free servers.
+pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<bool> {
     let mut panes = parse_panes(&tmux_output(&[
         "list-panes",
         "-a",
@@ -102,6 +110,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
     // Built lazily: only needed when a pane that was an agent no longer reports
     // one as its foreground command, to tell an exit from a foreground subprocess.
     let mut processes: Option<ProcessTree> = None;
+    let mut any_agent = false;
 
     for pane in &mut panes {
         let previous = pane.agent_status;
@@ -119,6 +128,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             }),
         };
         let next = if let Some(agent) = agent {
+            any_agent = true;
             let raw = detect_agent_state_from_title(agent, &pane.pane_title).unwrap_or_else(|| {
                 let evidence = AgentEvidence {
                     screen_tail: capture_pane_tail(&pane.pane_id, STATUS_CAPTURE_LINES),
@@ -142,7 +152,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
 
     write_window_status_icons(&panes)?;
     debounce.retain(|pane_id, _| live.contains(pane_id));
-    Ok(())
+    Ok(any_agent)
 }
 
 fn current_status_daemon_pid() -> String {
