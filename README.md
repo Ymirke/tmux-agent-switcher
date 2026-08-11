@@ -127,13 +127,16 @@ prefix that matches no window cancels itself, so the next digit starts fresh.
 Set these **before** the plugin loads:
 
 ```tmux
-set -g @agent_switcher_key 'C-n'       # key that opens the sidebar (default: C-n)
+set -g @agent_switcher_key 'C-n'       # key that opens the sidebar (default: C-n; 'none' = don't bind)
 set -g @agent_switcher_nav 'on'        # vim-aware C-h/C-j/C-k/C-l nav (default: on)
 set -g @agent_switcher_view 'sidebar'  # 'sidebar' (left), 'sidebar-right' (right) or 'palette' (floating)
 set -g @agent_switcher_input 'keys'    # 'keys' (default), 'numbers', or 'search'
 set -g @agent_switcher_tab_status 'on' # show agent state in tmux window tabs
 ```
 
+Set `@agent_switcher_key 'none'` to skip the root-table binding entirely and
+open the sidebar from your own binding instead, e.g.
+`bind a run-shell -b "~/.tmux/plugins/tmux-agent-switcher/bin/tmux-agent-switcher-popup '#{window_id}' '#{session_name}'"`.
 Set `@agent_switcher_nav 'off'` if you already bind
 <kbd>Ctrl</kbd>+<kbd>h/j/k/l</kbd> yourself or want to keep those keys.
 Set `@agent_switcher_tab_status 'off'` to leave tmux's window status formats

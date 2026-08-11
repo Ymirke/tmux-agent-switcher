@@ -7,7 +7,8 @@
 # first use, from the launcher script).
 #
 # Options (set before this plugin is loaded):
-#   set -g @agent_switcher_key 'C-n'   # key that opens the sidebar (default C-n)
+#   set -g @agent_switcher_key 'C-n'   # key that opens the sidebar (default C-n;
+#                                      # 'none' skips the binding entirely)
 #   set -g @agent_switcher_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default on)
 #   set -g @agent_switcher_tab_status 'on' # agent indicator in window tabs (default on)
 set -euo pipefail
@@ -53,8 +54,11 @@ configure_tab_status() {
 configure_tab_status window-status-format
 configure_tab_status window-status-current-format
 
-# Dedicated switcher opener.
-if [[ -n "$open_key" ]]; then
+# Dedicated switcher opener. 'none' (or 'off') skips the root-table binding for
+# users who open the popup from a binding of their own — an empty option can't
+# express that, because show-option returns "" for unset and the default would
+# win.
+if [[ "$open_key" != "none" && "$open_key" != "off" ]]; then
   tmux unbind-key -n "$open_key" 2>/dev/null || true
   tmux bind-key -n "$open_key" run-shell -b "$POPUP '#{window_id}' '#{session_name}'"
 fi
