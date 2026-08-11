@@ -10,6 +10,8 @@
 #   set -g @agent_switcher_key 'C-n'   # key that opens the sidebar (default C-n)
 #   set -g @agent_switcher_nav 'on'    # vim-aware C-h/C-j/C-k/C-l nav (default on)
 #   set -g @agent_switcher_tab_status 'on' # agent indicator in window tabs (default on)
+#   set -g @agent_switcher_daemon_autostart 'off' # start the status daemon at tmux
+#                                      # start instead of on first sidebar open
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,6 +37,7 @@ fi
 open_key="$(tmux_option @agent_switcher_key C-n)"
 nav="$(tmux_option @agent_switcher_nav on)"
 tab_status="$(tmux_option @agent_switcher_tab_status on)"
+daemon_autostart="$(tmux_option @agent_switcher_daemon_autostart off)"
 
 configure_tab_status() {
   local option="$1"
@@ -52,6 +55,18 @@ configure_tab_status() {
 
 configure_tab_status window-status-format
 configure_tab_status window-status-current-format
+
+# Start the status daemon at load instead of on first sidebar open. Without
+# this, the tab-status badges (on by default) sit empty after a tmux server
+# start until the sidebar is first opened — and anything a user builds on top
+# of @tmux_agent_switcher_window_icon starts blank. The daemon records its pid
+# in a tmux option and an older daemon exits on its next ownership check, so
+# config reloads are safe; run-shell -b keeps a first-use binary
+# download/build from ever blocking config load; going through bin/ re-resolves
+# the binary after a plugin update.
+if [[ "$daemon_autostart" == "on" ]]; then
+  tmux run-shell -b "exec '$CURRENT_DIR/bin/tmux-agent-switcher' status-daemon"
+fi
 
 # Dedicated switcher opener.
 if [[ -n "$open_key" ]]; then
