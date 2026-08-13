@@ -45,11 +45,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       # Builds for the target (using cross when needed), tars up the binary, and
-      # attaches it to the GitHub Release as tmux-agent-switcher-<target>.tar.gz —
-      # the exact name bin/tmux-agent-switcher-fetch downloads.
+      # attaches it to the GitHub Release as tmux-agent-sidebar-<target>.tar.gz —
+      # the exact name bin/tmux-agent-sidebar-fetch downloads.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: tmux-agent-switcher
+          bin: tmux-agent-sidebar
           target: ${{ matrix.target }}
-          archive: tmux-agent-switcher-$target
+          archive: tmux-agent-sidebar-$target
           token: ${{ secrets.GITHUB_TOKEN }}

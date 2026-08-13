@@ -1,4 +1,4 @@
-//! tmux-agent-switcher: a tmux sidebar that switches windows and monitors
+//! tmux-agent-sidebar: a tmux sidebar that switches windows and monitors
 //! running AI coding agents by passive observation.
 //!
 //! Module map:
@@ -21,6 +21,7 @@ mod detect;
 mod model;
 mod preview;
 mod search;
+mod spawn;
 mod tmux;
 mod ui;
 
@@ -41,7 +42,8 @@ pub use preview::normalize_preview_line;
 pub use search::filter_sessions;
 pub use tmux::{
     clear_unread_for_pane, create_session, create_window, current_window_id, env_tmux_value,
-    execute_action, parse_panes, parse_windows, rename_window, select_card,
+    execute_action, kill_window, move_window, parse_panes, parse_windows, rename_window,
+    select_card,
 };
 pub use ui::run_tui;
 pub use ui::state::{

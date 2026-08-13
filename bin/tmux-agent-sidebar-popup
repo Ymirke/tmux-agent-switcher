@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Opens tmux-agent-sidebar in a full-screen popup with a live pane preview.
+#
+# Usage: tmux-agent-sidebar-popup <window_id> <session_name> [down|up]
+set -euo pipefail
+
+window_id="${1:-}"
+session_name="${2:-}"
+direction="${3:-}"
+
+# The last mode selected in the UI takes priority over the configured default.
+view="$(tmux show-option -gqv '@tmux_agent_sidebar_view')"
+if [[ -z "$view" ]]; then
+  view="$(tmux show-option -gqv '@agent_sidebar_view')"
+fi
+input="$(tmux show-option -gqv '@tmux_agent_sidebar_input')"
+if [[ -z "$input" ]]; then
+  input="$(tmux show-option -gqv '@agent_sidebar_input')"
+fi
+
+args=(
+  -B -E -w 100% -h 100%
+  -e "TMUX_AGENT_SIDEBAR_CURRENT=${window_id}"
+  -e "TMUX_AGENT_SIDEBAR_SESSION=${session_name}"
+)
+if [[ -n "$direction" ]]; then
+  args+=(-e "TMUX_AGENT_SIDEBAR_INITIAL_MOVE=${direction}")
+fi
+if [[ -n "$view" ]]; then
+  args+=(-e "TMUX_AGENT_SIDEBAR_VIEW=${view}")
+fi
+if [[ -n "$input" ]]; then
+  args+=(-e "TMUX_AGENT_SIDEBAR_INPUT=${input}")
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec tmux display-popup "${args[@]}" "$script_dir/tmux-agent-sidebar"

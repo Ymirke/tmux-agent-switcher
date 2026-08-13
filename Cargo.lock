@@ -528,7 +528,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "tmux-agent-switcher"
+name = "tmux-agent-sidebar"
 version = "0.1.0"
 dependencies = [
  "anyhow",

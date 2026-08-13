@@ -17,7 +17,7 @@ use crate::{
     tmux::{parse_panes, parse_windows, tmux_output, tmux_status},
 };
 
-const SESSION_ORDER_OPTION: &str = "@tmux_agent_switcher_order";
+const SESSION_ORDER_OPTION: &str = "@tmux_agent_sidebar_order";
 
 pub fn codex_unread_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
@@ -149,7 +149,7 @@ pub(crate) fn load_session_order() -> Result<Vec<String>> {
     let output = tmux_output(&[
         "list-sessions",
         "-F",
-        "#{session_name}\t#{@tmux_agent_switcher_order}",
+        "#{session_name}\t#{@tmux_agent_sidebar_order}",
     ])?;
     let mut rows: Vec<(usize, Option<usize>, String)> = output
         .lines()
@@ -208,7 +208,7 @@ pub fn load_cards() -> Result<Vec<WindowCard>> {
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
+        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_sidebar_agent}\t#{@tmux_agent_sidebar_state}\t#{@tmux_agent_sidebar_seen}\t#{@tmux_agent_sidebar_run_started_at}\t#{@codex_status_state}\t#{@codex_status_unread}",
     ])?)?;
     Ok(build_cards_with_previews(
         &windows,

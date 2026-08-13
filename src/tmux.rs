@@ -128,7 +128,7 @@ fn parse_codex_hook_status(state: &str, unread: &str) -> Option<AgentStatus> {
 }
 
 pub fn current_window_id() -> Option<String> {
-    if let Some(window_id) = env_tmux_value("TMUX_AGENT_SWITCHER_CURRENT") {
+    if let Some(window_id) = env_tmux_value("TMUX_AGENT_SIDEBAR_CURRENT") {
         return Some(window_id);
     }
 
@@ -172,12 +172,33 @@ pub fn rename_window(window_id: &str, window_name: &str) -> Result<()> {
     tmux_status(Command::new("tmux").args(["rename-window", "-t", window_id, window_name]))
 }
 
+pub fn kill_window(window_id: &str) -> Result<()> {
+    tmux_status(Command::new("tmux").args(["kill-window", "-t", window_id]))
+}
+
 /// Swaps two windows' positions. `-d` keeps each session's current window
-/// current, so reordering behind the popup never changes what is focused.
+/// current, so reordering from the popup never changes what is focused.
 pub fn swap_windows(source_window_id: &str, target_window_id: &str) -> Result<()> {
     tmux_status(Command::new("tmux").args([
         "swap-window",
         "-d",
+        "-s",
+        source_window_id,
+        "-t",
+        target_window_id,
+    ]))
+}
+
+pub fn move_window(
+    source_window_id: &str,
+    target_window_id: &str,
+    before_target: bool,
+) -> Result<()> {
+    let position = if before_target { "-b" } else { "-a" };
+    tmux_status(Command::new("tmux").args([
+        "move-window",
+        "-d",
+        position,
         "-s",
         source_window_id,
         "-t",
@@ -346,15 +367,15 @@ mod tests {
 
     #[test]
     fn env_tmux_value_ignores_unexpanded_tmux_formats() {
-        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "#{window_id}");
-        assert_eq!(env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"), None);
+        std::env::set_var("TMUX_AGENT_SIDEBAR_TEST_LITERAL", "#{window_id}");
+        assert_eq!(env_tmux_value("TMUX_AGENT_SIDEBAR_TEST_LITERAL"), None);
 
-        std::env::set_var("TMUX_AGENT_SWITCHER_TEST_LITERAL", "@42");
+        std::env::set_var("TMUX_AGENT_SIDEBAR_TEST_LITERAL", "@42");
         assert_eq!(
-            env_tmux_value("TMUX_AGENT_SWITCHER_TEST_LITERAL"),
+            env_tmux_value("TMUX_AGENT_SIDEBAR_TEST_LITERAL"),
             Some("@42".to_owned())
         );
 
-        std::env::remove_var("TMUX_AGENT_SWITCHER_TEST_LITERAL");
+        std::env::remove_var("TMUX_AGENT_SIDEBAR_TEST_LITERAL");
     }
 }

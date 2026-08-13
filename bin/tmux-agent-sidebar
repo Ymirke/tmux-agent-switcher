@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Launcher for the tmux-agent-switcher TUI.
+# Launcher for the tmux-agent-sidebar TUI.
 #
 # Resolution order:
 #   1. Use an existing, up-to-date release binary.
@@ -9,7 +9,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"
-binary="$repo_dir/target/release/tmux-agent-switcher"
+binary="$repo_dir/target/release/tmux-agent-sidebar"
 
 # ratatui/crossterm handle color themselves; a stray NO_COLOR washes out the TUI.
 unset NO_COLOR
@@ -25,8 +25,8 @@ if [[ ! -x "$binary" ]] || sources_newer; then
 
   # Only download when there is no binary at all; if a developer edited the
   # sources we rebuild instead of clobbering their tree with a release build.
-  if [[ ! -x "$binary" && -z "${TMUX_AGENT_SWITCHER_NO_DOWNLOAD:-}" ]]; then
-    if "$script_dir/tmux-agent-switcher-fetch" "$binary" 2>/dev/null; then
+  if [[ ! -x "$binary" && -z "${TMUX_AGENT_SIDEBAR_NO_DOWNLOAD:-}" ]]; then
+    if "$script_dir/tmux-agent-sidebar-fetch" "$binary" 2>/dev/null; then
       fetched=1
     fi
   fi
@@ -38,9 +38,9 @@ if [[ ! -x "$binary" ]] || sources_newer; then
     fi
     if [[ -z "$cargo_bin" ]]; then
       cat >&2 <<'EOF'
-tmux-agent-switcher: no prebuilt binary for this platform and cargo was not found.
+tmux-agent-sidebar: no prebuilt binary for this platform and cargo was not found.
 Install Rust from https://rustup.rs and reopen, or download a release binary from
-https://github.com/Ymirke/tmux-agent-switcher/releases
+https://github.com/Ymirke/tmux-agent-sidebar/releases
 EOF
       exit 127
     fi

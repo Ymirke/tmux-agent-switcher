@@ -1,4 +1,4 @@
-use tmux_agent_switcher::{
+use tmux_agent_sidebar::{
     detect_agent_from_process_name, detect_agent_state, parse_panes, AgentEvidence, AgentKind,
     AgentState,
 };

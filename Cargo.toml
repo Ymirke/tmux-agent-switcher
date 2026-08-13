@@ -1,13 +1,13 @@
 [package]
-name = "tmux-agent-switcher"
+name = "tmux-agent-sidebar"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.74"
 description = "A tmux sidebar that switches windows and monitors running AI coding agents (Claude Code, Codex, OpenCode) by passive observation."
 authors = ["Ymir Egilson <36711026+Ymirke@users.noreply.github.com>"]
 license = "MIT"
-repository = "https://github.com/Ymirke/tmux-agent-switcher"
-homepage = "https://github.com/Ymirke/tmux-agent-switcher"
+repository = "https://github.com/Ymirke/tmux-agent-sidebar"
+homepage = "https://github.com/Ymirke/tmux-agent-sidebar"
 readme = "README.md"
 keywords = ["tmux", "tui", "claude", "codex", "opencode"]
 categories = ["command-line-utilities"]
