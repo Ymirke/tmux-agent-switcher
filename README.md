@@ -12,6 +12,8 @@ can find an agent that needs input.
 > Detection is passive. The plugin does not wrap or start your agents. Run
 > `claude`, `codex`, or `opencode` as usual inside tmux.
 
+![tmux-agent-sidebar showing agent statuses and a live Codex pane preview](assets/demo.png)
+
 ## Features
 
 - A full-screen popup with a sidebar and live preview of the selected window.
