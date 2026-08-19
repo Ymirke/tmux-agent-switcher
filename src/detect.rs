@@ -55,7 +55,7 @@ pub(crate) fn detect_agent_state_from_title(agent: AgentKind, title: &str) -> Op
         AgentKind::Codex if title.contains("Action Required") => Some(AgentState::Blocked),
         AgentKind::Codex if starts_with_braille_status(title) => Some(AgentState::Working),
         AgentKind::Codex if !title.is_empty() => Some(AgentState::Idle),
-        AgentKind::Claude if starts_with_braille_status(title) => Some(AgentState::Working),
+        AgentKind::Claude if starts_with_claude_working_status(title) => Some(AgentState::Working),
         // OpenCode's title is a static session label ("OpenCode" or "OC | …")
         // and does not encode activity, so always fall through to screen-tail
         // detection for it.
@@ -114,14 +114,56 @@ fn detect_claude_state(evidence: &AgentEvidence) -> AgentState {
         return AgentState::Blocked;
     }
 
-    // Working: Claude prefixes its OSC title with a braille spinner while active.
-    if starts_with_braille_status(title) {
+    // Working: Claude prefixes its OSC title with an animated status glyph while
+    // active. Older releases used a braille spinner; 2.1.235 uses ◐/◑ instead.
+    if starts_with_claude_working_status(title) {
+        return AgentState::Working;
+    }
+
+    // Working: the main loop is parked at the prompt but background subagents are
+    // still running. The title has the idle ✳ prefix in this state, so the only
+    // signal is the live "✻ Waiting for N background agents to finish" status line.
+    if waiting_on_background_agents(&recent) {
         return AgentState::Working;
     }
 
     // Otherwise Claude is idle at its input prompt (title starts with ✳). The `❯`
     // input box is present while working too, so it is not an idle signal on its own.
     AgentState::Idle
+}
+
+/// True when Claude's live status line — the last content line above the input
+/// prompt — says it is waiting on background agents/tasks. The same line also
+/// persists in the transcript after each agent wake-up, so matching anywhere in
+/// the tail would pin a settled pane Working; only the live copy counts, which
+/// is why this walks up from the input prompt instead of substring-matching the
+/// whole region.
+fn waiting_on_background_agents(recent: &str) -> bool {
+    let lines: Vec<&str> = recent.lines().collect();
+    // The input prompt is the last `❯` line on screen; selection-menu cursors
+    // (also `❯`-prefixed) always render above the input box.
+    let Some(prompt) = lines
+        .iter()
+        .rposition(|line| strip_border(line).starts_with('❯'))
+    else {
+        return false;
+    };
+    for line in lines[..prompt].iter().rev() {
+        let stripped = strip_border(line).trim_end();
+        // Skip the chrome between the status line and the prompt: blank lines,
+        // the input box border, and attached `⎿` tip/result lines.
+        if stripped.is_empty()
+            || stripped.starts_with('⎿')
+            || stripped
+                .chars()
+                .all(|ch| matches!(ch, '─' | '━' | '═' | '╌' | '╭' | '╮' | '╰' | '╯'))
+        {
+            continue;
+        }
+        let lower = stripped.to_lowercase();
+        return lower.contains("waiting for") && lower.contains("background");
+    }
+    false
 }
 
 fn detect_opencode_state(evidence: &AgentEvidence) -> AgentState {
@@ -228,6 +270,15 @@ fn starts_with_braille_status(value: &str) -> bool {
         && matches!(chars.next(), Some(' '))
 }
 
+fn starts_with_claude_working_status(value: &str) -> bool {
+    if starts_with_braille_status(value) {
+        return true;
+    }
+
+    let mut chars = value.chars();
+    matches!(chars.next(), Some('◐' | '◑')) && matches!(chars.next(), Some(' '))
+}
+
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
@@ -326,6 +377,14 @@ mod tests {
         );
         assert_eq!(
             detect_agent_state_from_title(AgentKind::Claude, "⠋ thinking"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "◐ using tools"),
+            Some(AgentState::Working)
+        );
+        assert_eq!(
+            detect_agent_state_from_title(AgentKind::Claude, "◑ using tools"),
             Some(AgentState::Working)
         );
         assert_eq!(
@@ -438,6 +497,64 @@ mod tests {
             ]
             .join("\n"),
             osc_title: "✳ clarify the logic".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::Claude, &evidence),
+            AgentState::Idle
+        );
+    }
+
+    #[test]
+    fn claude_waiting_on_background_agents_is_working() {
+        // Main loop parked at the prompt (idle ✳ title) while subagents run:
+        // the live waiting line sits directly above the input box.
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "⏺ The schema/migrations review is in — one Critical finding.",
+                "",
+                "✻ Waiting for 2 background agents to finish",
+                "",
+                "───────────────────────────────",
+                "❯ ",
+                "───────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · /tasks to see subagents · ← for agents",
+                "",
+                "  ⏺ main",
+                "  ◯ pr-reviewer  Reviewing routes diff        4m 29s · ↓ 131.4k tokens",
+            ]
+            .join("\n"),
+            osc_title: "✳ review the PR".to_owned(),
+            osc_progress: String::new(),
+            process_exited: false,
+        };
+        assert_eq!(
+            detect_agent_state(AgentKind::Claude, &evidence),
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn claude_stale_waiting_line_in_transcript_is_idle() {
+        // After the run settles, old waiting lines remain in the transcript but
+        // the last content above the prompt is the final answer — not the live
+        // status line — so the pane must read Idle, not stuck Working.
+        let evidence = AgentEvidence {
+            screen_tail: [
+                "✻ Waiting for 1 background agent to finish",
+                "",
+                "⏺ Agent \"Review routes\" finished · 9m 02s",
+                "",
+                "⏺ All three reviews are done; merged report above.",
+                "",
+                "───────────────────────────────",
+                "❯ ",
+                "───────────────────────────────",
+                "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+            ]
+            .join("\n"),
+            osc_title: "✳ review the PR".to_owned(),
             osc_progress: String::new(),
             process_exited: false,
         };
