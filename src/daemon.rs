@@ -37,6 +37,7 @@ const IDLE_DEBOUNCE_POLLS: u32 = 4;
 pub(crate) const BUSY_DEBOUNCE_POLLS: u32 = 2;
 const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_sidebar_status_daemon_pid";
 const STATUS_DAEMON_BUILD_OPTION: &str = "@tmux_agent_sidebar_status_daemon_build";
+const STATUS_DAEMON_CLAIM_LOCK: &str = "tmux-agent-sidebar-status-daemon-claim";
 const STATUS_AGENT_OPTION: &str = "@tmux_agent_sidebar_agent";
 const STATUS_STATE_OPTION: &str = "@tmux_agent_sidebar_state";
 pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_sidebar_seen";
@@ -68,12 +69,7 @@ pub fn ensure_status_daemon() -> Result<()> {
     drop(last_check);
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let pid = current_status_daemon_pid();
-    let running_current_build = executable_fingerprint(&current_exe)
-        .map(|fingerprint| tmux_option(STATUS_DAEMON_BUILD_OPTION) == fingerprint)
-        .unwrap_or(true);
-    if !pid.is_empty() && running_current_build && status_daemon_process_matches(&pid, &current_exe)
-    {
+    if status_daemon_is_current(&current_exe) {
         return Ok(());
     }
 
@@ -156,9 +152,30 @@ fn tmux_option(name: &str) -> String {
         .to_owned()
 }
 
+struct StatusDaemonClaimLock;
+
+impl StatusDaemonClaimLock {
+    fn acquire() -> Result<Self> {
+        tmux_status(Command::new("tmux").args(["wait-for", "-L", STATUS_DAEMON_CLAIM_LOCK]))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for StatusDaemonClaimLock {
+    fn drop(&mut self) {
+        let _ =
+            tmux_status(Command::new("tmux").args(["wait-for", "-U", STATUS_DAEMON_CLAIM_LOCK]));
+    }
+}
+
 pub fn run_status_daemon() -> Result<()> {
-    let pid = std::process::id().to_string();
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let claim_lock = StatusDaemonClaimLock::acquire()?;
+    if status_daemon_is_current(&current_exe) {
+        return Ok(());
+    }
+
+    let pid = std::process::id().to_string();
     let fingerprint = executable_fingerprint(&current_exe).unwrap_or_default();
     tmux_status(Command::new("tmux").args([
         "set-option",
@@ -173,6 +190,7 @@ pub fn run_status_daemon() -> Result<()> {
         STATUS_DAEMON_BUILD_OPTION,
         &fingerprint,
     ]))?;
+    drop(claim_lock);
 
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
     let mut ownership_check = 0;
@@ -307,6 +325,14 @@ fn current_status_daemon_pid() -> String {
         .unwrap_or_default()
         .trim()
         .to_owned()
+}
+
+fn status_daemon_is_current(current_exe: &Path) -> bool {
+    let pid = current_status_daemon_pid();
+    let running_current_build = executable_fingerprint(current_exe)
+        .map(|fingerprint| tmux_option(STATUS_DAEMON_BUILD_OPTION) == fingerprint)
+        .unwrap_or(true);
+    !pid.is_empty() && running_current_build && status_daemon_process_matches(&pid, current_exe)
 }
 
 fn status_daemon_process_matches(pid: &str, current_exe: &Path) -> bool {
