@@ -90,6 +90,8 @@ Inside the sidebar, Vim input mode is the default:
 - Press <kbd>Shift</kbd>+<kbd>Tab</kbd> to place the sidebar on the left or
   right, or use the centered palette view.
 - Press <kbd>r</kbd> to rename the selected window.
+- Press <kbd>u</kbd> to mark the selected tab unread.
+- Press <kbd>e</kbd> to mark the selected tab read without opening it.
 - Press <kbd>x</kbd> to close the selected window.
 - Press <kbd>Ctrl</kbd>+<kbd>t</kbd> to create a window.
 - Press <kbd>Ctrl</kbd>+<kbd>s</kbd> to create a session.

@@ -42,8 +42,8 @@ pub use preview::normalize_preview_line;
 pub use search::filter_sessions;
 pub use tmux::{
     clear_unread_for_pane, create_session, create_window, current_window_id, env_tmux_value,
-    execute_action, kill_window, move_window, parse_panes, parse_windows, rename_window,
-    select_card,
+    execute_action, kill_window, mark_unread_for_pane, mark_window_read, move_window, parse_panes,
+    parse_windows, rename_window, select_card,
 };
 pub use ui::run_tui;
 pub use ui::state::{

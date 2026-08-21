@@ -12,12 +12,14 @@ use anyhow::{anyhow, Context, Result};
 
 use crate::{
     cards::{codex_unread_dir, codex_unread_file},
-    daemon::mark_window_seen,
+    daemon::STATUS_SEEN_OPTION,
     model::{
         parse_agent_kind, parse_agent_state, AgentKind, AgentState, AgentStatus, SwitcherAction,
         TmuxPane, TmuxWindow,
     },
 };
+
+const CODEX_STATUS_UNREAD_OPTION: &str = "@codex_status_unread";
 
 pub fn parse_windows(output: &str) -> Result<Vec<TmuxWindow>> {
     output
@@ -148,8 +150,9 @@ pub fn select_card(card: &crate::model::WindowCard) -> Result<()> {
     tmux_status(Command::new("tmux").args(["switch-client", "-t", &card.session_name]))?;
     tmux_status(Command::new("tmux").args(["select-window", "-t", &card.window_id]))?;
     tmux_status(Command::new("tmux").args(["select-pane", "-t", &card.target_pane_id]))?;
-    clear_unread_for_pane(&card.target_pane_id);
-    mark_window_seen(&card.window_id);
+    if mark_window_read(&card.window_id).is_err() {
+        clear_unread_for_pane(&card.target_pane_id);
+    }
     Ok(())
 }
 
@@ -242,7 +245,34 @@ pub fn create_session(session_name: &str) -> Result<()> {
 }
 
 pub fn clear_unread_for_pane(pane_id: &str) {
-    let _ = fs::remove_file(codex_unread_file(&codex_unread_dir(), pane_id));
+    let _ = clear_unread_for_pane_in(&codex_unread_dir(), pane_id);
+}
+
+pub fn mark_unread_for_pane(pane_id: &str) -> Result<()> {
+    mark_unread_for_pane_in(&codex_unread_dir(), pane_id)
+}
+
+fn mark_unread_for_pane_in(state_dir: &std::path::Path, pane_id: &str) -> Result<()> {
+    fs::create_dir_all(state_dir).context("failed to create unread state directory")?;
+    fs::write(codex_unread_file(state_dir, pane_id), b"{}\n").context("failed to mark pane unread")
+}
+
+pub fn mark_window_read(window_id: &str) -> Result<()> {
+    let output = tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"])?;
+    for pane_id in output.lines().filter(|line| !line.trim().is_empty()) {
+        clear_unread_for_pane_in(&codex_unread_dir(), pane_id)?;
+        set_pane_option(pane_id, STATUS_SEEN_OPTION, "1")?;
+        set_pane_option(pane_id, CODEX_STATUS_UNREAD_OPTION, "0")?;
+    }
+    Ok(())
+}
+
+fn clear_unread_for_pane_in(state_dir: &std::path::Path, pane_id: &str) -> Result<()> {
+    match fs::remove_file(codex_unread_file(state_dir, pane_id)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to clear pane unread marker"),
+    }
 }
 
 pub(crate) fn set_pane_option(pane_id: &str, option: &str, value: &str) -> Result<()> {
@@ -289,6 +319,29 @@ pub(crate) fn tmux_status(command: &mut Command) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn marking_a_pane_unread_creates_its_marker() {
+        let dir = tempfile::tempdir().unwrap();
+
+        mark_unread_for_pane_in(dir.path(), "%42").unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("42.json")).unwrap(),
+            "{}\n"
+        );
+    }
+
+    #[test]
+    fn clearing_a_pane_unread_removes_its_marker_and_allows_missing_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_unread_for_pane_in(dir.path(), "%42").unwrap();
+
+        clear_unread_for_pane_in(dir.path(), "%42").unwrap();
+        clear_unread_for_pane_in(dir.path(), "%42").unwrap();
+
+        assert!(!dir.path().join("42.json").exists());
+    }
 
     #[test]
     fn parses_tmux_window_rows() {

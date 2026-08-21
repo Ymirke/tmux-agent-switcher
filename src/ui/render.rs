@@ -641,6 +641,7 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "↑/↓: move, C-j/C-k: open",
         "h/l · ←/→: session",
         "↵/r/x: open/rename/close",
+        "u/e: mark unread/read",
         "C-t/C-s: new win/sess",
         "C-u: clear filter",
         "esc: clear, then close",
@@ -1037,13 +1038,14 @@ mod tests {
                     || row.contains("C-j/C-k")
                     || row.contains("h/l · ←/→")
                     || row.contains("↵/r/x:")
+                    || row.contains("u/e: mark unread/read")
                     || row.contains("C-t/C-s:")
                     || row.contains("C-u:")
                     || row.contains("esc:")
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(help_rows.len(), 13);
+        assert_eq!(help_rows.len(), 14);
         assert!(help_rows
             .iter()
             .any(|row| row.contains("tab: vim / nums / search")));
@@ -1072,6 +1074,9 @@ mod tests {
         assert!(help_rows
             .iter()
             .any(|row| row.contains("↵/r/x: open/rename/close")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("u/e: mark unread/read")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("C-t/C-s: new win/sess")));

@@ -652,14 +652,6 @@ fn write_window_status_icons(panes: &[TmuxPane]) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn mark_window_seen(window_id: &str) {
-    let output =
-        tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"]).unwrap_or_default();
-    for pane_id in output.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = set_pane_option(pane_id, STATUS_SEEN_OPTION, "1");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

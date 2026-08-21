@@ -36,8 +36,8 @@ use crate::{
     preview::PreviewMirror,
     search::{apply_query, delete_query_word, filter_sessions},
     tmux::{
-        current_window_id, env_tmux_value, kill_window, move_window, rename_window, swap_windows,
-        tmux_output, tmux_status,
+        current_window_id, env_tmux_value, kill_window, mark_unread_for_pane, mark_window_read,
+        move_window, rename_window, swap_windows, tmux_output, tmux_status,
     },
 };
 use layout::{compact_navigation_height, switcher_layout};
@@ -380,6 +380,63 @@ impl SwitcherUi {
         );
     }
 
+    /// Persists an unread marker and patches both card caches so the selected
+    /// tab changes appearance without waiting for the next card refresh.
+    fn mark_selected_unread_with<F>(&mut self, mark_unread: F)
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let Some((window_id, pane_id)) = self
+            .state
+            .selected_card(&self.filtered)
+            .map(|card| (card.window_id.clone(), card.target_pane_id.clone()))
+        else {
+            return;
+        };
+        if mark_unread(&pane_id).is_err() {
+            return;
+        }
+
+        for session in self.sessions.iter_mut().chain(self.filtered.iter_mut()) {
+            if let Some(card) = session
+                .cards
+                .iter_mut()
+                .find(|card| card.window_id == window_id)
+            {
+                card.codex_unread = true;
+            }
+        }
+    }
+
+    /// Clears every unread signal for the selected window and patches both
+    /// card caches so the change is visible without opening the tab.
+    fn mark_selected_read_with<F>(&mut self, mark_read: F)
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let Some(window_id) = self
+            .state
+            .selected_card(&self.filtered)
+            .map(|card| card.window_id.clone())
+        else {
+            return;
+        };
+        if mark_read(&window_id).is_err() {
+            return;
+        }
+
+        for session in self.sessions.iter_mut().chain(self.filtered.iter_mut()) {
+            if let Some(card) = session
+                .cards
+                .iter_mut()
+                .find(|card| card.window_id == window_id)
+            {
+                card.codex_unread = false;
+                card.agent_status.seen = true;
+            }
+        }
+    }
+
     /// Moves the selected window one slot, including across session boundaries.
     /// The cache changes immediately and tmux mirrors the move. If tmux rejects
     /// it because a window vanished, the next card refresh restores real state.
@@ -451,6 +508,28 @@ impl SwitcherUi {
     ) -> Option<Option<SwitcherAction>>
     where
         F: FnOnce(&str) -> Result<()>,
+    {
+        self.handle_key_with_actions(
+            key,
+            terminal_size,
+            close_window,
+            mark_unread_for_pane,
+            mark_window_read,
+        )
+    }
+
+    fn handle_key_with_actions<F, G, H>(
+        &mut self,
+        key: KeyEvent,
+        terminal_size: Rect,
+        close_window: F,
+        mark_unread: G,
+        mark_read: H,
+    ) -> Option<Option<SwitcherAction>>
+    where
+        F: FnOnce(&str) -> Result<()>,
+        G: FnOnce(&str) -> Result<()>,
+        H: FnOnce(&str) -> Result<()>,
     {
         if let Some(active_prompt) = self.prompt.as_mut() {
             if let Some(result) = handle_prompt_key(active_prompt, key) {
@@ -638,6 +717,14 @@ impl SwitcherUi {
             KeyCode::Char('x') if self.input != InputMode::Search => {
                 self.numbered_input.clear();
                 self.close_selected_window_with(navigation_height, close_window);
+            }
+            KeyCode::Char('u') if self.input == InputMode::Keys => {
+                self.numbered_input.clear();
+                self.mark_selected_unread_with(mark_unread);
+            }
+            KeyCode::Char('e') if self.input == InputMode::Keys => {
+                self.numbered_input.clear();
+                self.mark_selected_read_with(mark_read);
             }
             KeyCode::Char('j' | 'k') if self.input == InputMode::Numbers => {
                 self.numbered_input.clear();
@@ -1188,5 +1275,86 @@ mod tests {
             None
         );
         assert_eq!(ui.query, "x");
+    }
+
+    #[test]
+    fn u_marks_the_selected_tab_unread_in_vim_mode() {
+        let mut ui = test_ui(InputMode::Keys);
+        let mut marked_pane = None;
+
+        assert_eq!(
+            ui.handle_key_with_actions(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+                Rect::new(0, 0, 100, 40),
+                |_| panic!("u must not close a window"),
+                |pane_id| {
+                    marked_pane = Some(pane_id.to_owned());
+                    Ok(())
+                },
+                |_| panic!("u must not mark a window read"),
+            ),
+            None
+        );
+
+        assert_eq!(marked_pane.as_deref(), Some("%work-2"));
+        assert!(ui.sessions[0].cards[1].codex_unread);
+        assert!(ui.filtered[0].cards[1].codex_unread);
+    }
+
+    #[test]
+    fn u_keeps_its_existing_behavior_outside_vim_mode() {
+        let terminal_size = Rect::new(0, 0, 100, 40);
+
+        let mut numbers = test_ui(InputMode::Numbers);
+        numbers.handle_key_with_actions(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            terminal_size,
+            |_| panic!("u must not close a window"),
+            |_| panic!("u must not mark unread in number mode"),
+            |_| panic!("u must not mark read in number mode"),
+        );
+        assert!(!numbers.filtered[0].cards[1].codex_unread);
+
+        let mut search = test_ui(InputMode::Search);
+        search.handle_key_with_actions(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            terminal_size,
+            |_| panic!("u must not close a window"),
+            |_| panic!("u must remain query text in search mode"),
+            |_| panic!("u must remain query text in search mode"),
+        );
+        assert_eq!(search.query, "u");
+    }
+
+    #[test]
+    fn e_marks_the_selected_tab_read_in_vim_mode() {
+        let mut ui = test_ui(InputMode::Keys);
+        for session in [&mut ui.sessions, &mut ui.filtered] {
+            let card = &mut session[0].cards[1];
+            card.codex_unread = true;
+            card.agent_status =
+                crate::model::AgentStatus::done(Some(crate::model::AgentKind::Codex));
+        }
+        let mut marked_window = None;
+
+        assert_eq!(
+            ui.handle_key_with_actions(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                Rect::new(0, 0, 100, 40),
+                |_| panic!("e must not close a window"),
+                |_| panic!("e must not mark a pane unread"),
+                |window_id| {
+                    marked_window = Some(window_id.to_owned());
+                    Ok(())
+                },
+            ),
+            None
+        );
+
+        assert_eq!(marked_window.as_deref(), Some("@work-2"));
+        assert!(!ui.sessions[0].cards[1].codex_unread);
+        assert!(ui.sessions[0].cards[1].agent_status.seen);
+        assert!(!ui.filtered[0].cards[1].codex_unread);
+        assert!(ui.filtered[0].cards[1].agent_status.seen);
     }
 }
