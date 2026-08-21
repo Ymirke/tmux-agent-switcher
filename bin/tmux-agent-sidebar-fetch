@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Download the prebuilt release binary for the current platform.
 #
-# Usage: tmux-agent-switcher-fetch <destination-path>
+# Usage: tmux-agent-sidebar-fetch <destination-path>
 #
 # Exits non-zero (leaving the destination untouched) if no matching asset is
 # available, so callers can fall back to building from source.
 set -euo pipefail
 
-dest="${1:?usage: tmux-agent-switcher-fetch <destination-path>}"
-repo="Ymirke/tmux-agent-switcher"
-bin_name="tmux-agent-switcher"
+dest="${1:?usage: tmux-agent-sidebar-fetch <destination-path>}"
+repo="Ymirke/tmux-agent-sidebar"
+bin_name="tmux-agent-sidebar"
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -19,13 +19,13 @@ case "$os-$arch" in
   Linux-x86_64)                  target="x86_64-unknown-linux-musl" ;;
   Linux-arm64 | Linux-aarch64)   target="aarch64-unknown-linux-musl" ;;
   *)
-    echo "tmux-agent-switcher-fetch: unsupported platform $os-$arch" >&2
+    echo "tmux-agent-sidebar-fetch: unsupported platform $os-$arch" >&2
     exit 1
     ;;
 esac
 
-command -v curl >/dev/null 2>&1 || { echo "tmux-agent-switcher-fetch: curl is required" >&2; exit 1; }
-command -v tar >/dev/null 2>&1 || { echo "tmux-agent-switcher-fetch: tar is required" >&2; exit 1; }
+command -v curl >/dev/null 2>&1 || { echo "tmux-agent-sidebar-fetch: curl is required" >&2; exit 1; }
+command -v tar >/dev/null 2>&1 || { echo "tmux-agent-sidebar-fetch: tar is required" >&2; exit 1; }
 
 asset="${bin_name}-${target}.tar.gz"
 url="https://github.com/${repo}/releases/latest/download/${asset}"
@@ -33,20 +33,20 @@ url="https://github.com/${repo}/releases/latest/download/${asset}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-echo "tmux-agent-switcher: downloading prebuilt binary ($target)..." >&2
+echo "tmux-agent-sidebar: downloading prebuilt binary ($target)..." >&2
 if ! curl -fsSL "$url" -o "$tmp/$asset"; then
-  echo "tmux-agent-switcher-fetch: no release asset at $url" >&2
+  echo "tmux-agent-sidebar-fetch: no release asset at $url" >&2
   exit 1
 fi
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 found="$(find "$tmp" -type f -name "$bin_name" | head -n1)"
 if [[ -z "$found" ]]; then
-  echo "tmux-agent-switcher-fetch: '$bin_name' not found in $asset" >&2
+  echo "tmux-agent-sidebar-fetch: '$bin_name' not found in $asset" >&2
   exit 1
 fi
 
 mkdir -p "$(dirname "$dest")"
 install -m 0755 "$found" "$dest"
 touch "$dest" # ensure it is newer than the checked-out sources
-echo "tmux-agent-switcher: installed $dest" >&2
+echo "tmux-agent-sidebar: installed $dest" >&2

@@ -6,8 +6,9 @@ use std::{
     collections::{HashMap, HashSet},
     path::Path,
     process::Command,
+    sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -23,11 +24,7 @@ use crate::{
 };
 
 const STATUS_DAEMON_INTERVAL: Duration = Duration::from_millis(300);
-// With no agent panes there is nothing to debounce and no state to transition —
-// the only event worth noticing is an agent starting, and a ~2s first-badge
-// delay is imperceptible. Polling lazily cuts the daemon's steady-state cost
-// (a tmux subprocess spawn every 300ms) to near zero on agent-free servers.
-const STATUS_DAEMON_IDLE_INTERVAL: Duration = Duration::from_secs(2);
+const NO_AGENT_DAEMON_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_DAEMON_OWNERSHIP_CHECK_POLLS: u32 = 10;
 const STATUS_CAPTURE_LINES: usize = 25;
 /// Consecutive idle polls required before committing a Working/Blocked -> Idle
@@ -38,18 +35,45 @@ const IDLE_DEBOUNCE_POLLS: u32 = 4;
 /// state, so a single stray Working/Blocked sample can't wipe a committed "done"
 /// or restart its timer. Kept short so real work still shows promptly.
 pub(crate) const BUSY_DEBOUNCE_POLLS: u32 = 2;
-const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_switcher_status_daemon_pid";
-const STATUS_AGENT_OPTION: &str = "@tmux_agent_switcher_agent";
-const STATUS_STATE_OPTION: &str = "@tmux_agent_switcher_state";
-pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_switcher_seen";
-const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_switcher_run_started_at";
-const STATUS_UPDATED_OPTION: &str = "@tmux_agent_switcher_updated";
-const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_switcher_window_icon";
+const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_sidebar_status_daemon_pid";
+const STATUS_DAEMON_BUILD_OPTION: &str = "@tmux_agent_sidebar_status_daemon_build";
+const STATUS_AGENT_OPTION: &str = "@tmux_agent_sidebar_agent";
+const STATUS_STATE_OPTION: &str = "@tmux_agent_sidebar_state";
+pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_sidebar_seen";
+const STATUS_RUN_STARTED_OPTION: &str = "@tmux_agent_sidebar_run_started_at";
+const STATUS_UPDATED_OPTION: &str = "@tmux_agent_sidebar_updated";
+const STATUS_WINDOW_ICON_OPTION: &str = "@tmux_agent_sidebar_window_icon";
+const TICK_COMMAND_OPTION: &str = "@agent_sidebar_tick_command";
+const TICK_INTERVAL_OPTION: &str = "@agent_sidebar_tick_interval";
+const DEFAULT_TICK_INTERVAL: Duration = Duration::from_secs(60);
+const PROCESS_TREE_MAX_AGE: Duration = Duration::from_millis(1200);
+const IDLE_DAEMON_INTERVAL: Duration = Duration::from_secs(1);
+const QUIET_POLLS_BEFORE_BACKOFF: u32 = 20;
+const DAEMON_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 pub fn ensure_status_daemon() -> Result<()> {
+    static LAST_CHECK: Mutex<Option<Instant>> = Mutex::new(None);
+
+    let mut last_check = match LAST_CHECK.lock() {
+        Ok(last_check) => last_check,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let recently_checked = last_check
+        .as_ref()
+        .is_some_and(|checked| checked.elapsed() < DAEMON_CHECK_INTERVAL);
+    if recently_checked {
+        return Ok(());
+    }
+    *last_check = Some(Instant::now());
+    drop(last_check);
+
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     let pid = current_status_daemon_pid();
-    if !pid.is_empty() && status_daemon_process_matches(&pid, &current_exe) {
+    let running_current_build = executable_fingerprint(&current_exe)
+        .map(|fingerprint| tmux_option(STATUS_DAEMON_BUILD_OPTION) == fingerprint)
+        .unwrap_or(true);
+    if !pid.is_empty() && running_current_build && status_daemon_process_matches(&pid, &current_exe)
+    {
         return Ok(());
     }
 
@@ -60,56 +84,172 @@ pub fn ensure_status_daemon() -> Result<()> {
     tmux_status(Command::new("tmux").args(["run-shell", "-b", &command]))
 }
 
+struct Pace {
+    quiet_polls: u32,
+}
+
+impl Pace {
+    fn new() -> Self {
+        Self { quiet_polls: 0 }
+    }
+
+    fn after(&mut self, any_agent: bool, changed: bool) -> Duration {
+        if !any_agent {
+            self.quiet_polls = 0;
+            return NO_AGENT_DAEMON_INTERVAL;
+        }
+
+        if changed {
+            self.quiet_polls = 0;
+            return STATUS_DAEMON_INTERVAL;
+        }
+
+        self.quiet_polls = self.quiet_polls.saturating_add(1);
+        if self.quiet_polls >= QUIET_POLLS_BEFORE_BACKOFF {
+            return IDLE_DAEMON_INTERVAL;
+        }
+        STATUS_DAEMON_INTERVAL
+    }
+}
+
+struct Tick {
+    last_run: Instant,
+    interval: Duration,
+}
+
+impl Tick {
+    fn new() -> Self {
+        Self {
+            last_run: Instant::now(),
+            interval: read_tick_interval(),
+        }
+    }
+
+    fn run_if_due(&mut self) {
+        if self.last_run.elapsed() < self.interval {
+            return;
+        }
+        self.last_run = Instant::now();
+        self.interval = read_tick_interval();
+        crate::spawn::shell_detached(&tmux_option(TICK_COMMAND_OPTION));
+    }
+}
+
+fn read_tick_interval() -> Duration {
+    parse_tick_interval(&tmux_option(TICK_INTERVAL_OPTION))
+}
+
+fn parse_tick_interval(value: &str) -> Duration {
+    value
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_TICK_INTERVAL)
+}
+
+fn tmux_option(name: &str) -> String {
+    tmux_output(&["show-option", "-gqv", name])
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
 pub fn run_status_daemon() -> Result<()> {
     let pid = std::process::id().to_string();
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let fingerprint = executable_fingerprint(&current_exe).unwrap_or_default();
     tmux_status(Command::new("tmux").args([
         "set-option",
         "-g",
         "-q",
         STATUS_DAEMON_PID_OPTION,
         &pid,
+        ";",
+        "set-option",
+        "-g",
+        "-q",
+        STATUS_DAEMON_BUILD_OPTION,
+        &fingerprint,
     ]))?;
 
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
     let mut ownership_check = 0;
+    let mut tick = Tick::new();
+    let mut pace = Pace::new();
+    let mut previous_panes: Option<HashSet<String>> = None;
     loop {
         if ownership_check == 0 && current_status_daemon_pid() != pid {
             break;
         }
         ownership_check = (ownership_check + 1) % STATUS_DAEMON_OWNERSHIP_CHECK_POLLS;
 
-        match poll_agent_status_once(&mut debounce) {
-            Err(_) => break,
-            Ok(true) => thread::sleep(STATUS_DAEMON_INTERVAL),
-            Ok(false) => thread::sleep(STATUS_DAEMON_IDLE_INTERVAL),
-        }
+        let Ok(outcome) = poll_agent_status_once_with_activity(&mut debounce) else {
+            break;
+        };
+        let pane_set_changed = previous_panes.as_ref() != Some(&outcome.panes);
+        previous_panes = Some(outcome.panes);
+        tick.run_if_due();
+        thread::sleep(pace.after(outcome.any_agent, outcome.raw_changed || pane_set_changed));
     }
 
-    let _ = tmux_status(Command::new("tmux").args([
-        "set-option",
-        "-g",
-        "-u",
-        "-q",
-        STATUS_DAEMON_PID_OPTION,
-    ]));
+    if current_status_daemon_pid() == pid {
+        let _ = tmux_status(Command::new("tmux").args([
+            "set-option",
+            "-g",
+            "-u",
+            "-q",
+            STATUS_DAEMON_PID_OPTION,
+            ";",
+            "set-option",
+            "-g",
+            "-u",
+            "-q",
+            STATUS_DAEMON_BUILD_OPTION,
+        ]));
+    }
     Ok(())
 }
 
-/// Returns whether any pane currently hosts an agent, so the caller can poll
-/// lazily on agent-free servers.
-pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<bool> {
+pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Result<()> {
+    poll_agent_status_once_with_activity(debounce).map(|_| ())
+}
+
+struct PollOutcome {
+    panes: HashSet<String>,
+    raw_changed: bool,
+    any_agent: bool,
+}
+
+fn raw_sample_changed(
+    previous: AgentStatus,
+    previous_raw: Option<AgentState>,
+    agent: AgentKind,
+    raw: AgentState,
+) -> bool {
+    previous.agent != Some(agent)
+        || previous_raw
+            .map(|state| state != raw)
+            .unwrap_or(previous.state != raw)
+}
+
+fn poll_agent_status_once_with_activity(
+    debounce: &mut HashMap<String, Debounce>,
+) -> Result<PollOutcome> {
     let mut panes = parse_panes(&tmux_output(&[
         "list-panes",
         "-a",
         "-F",
-        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_switcher_agent}\t#{@tmux_agent_switcher_state}\t#{@tmux_agent_switcher_seen}\t#{@tmux_agent_switcher_run_started_at}",
+        "#{pane_id}\t#{window_id}\t#{pane_active}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_title}\t#{pane_pid}\t#{@tmux_agent_sidebar_agent}\t#{@tmux_agent_sidebar_state}\t#{@tmux_agent_sidebar_seen}\t#{@tmux_agent_sidebar_run_started_at}",
     ])?)?;
 
     let now = unix_timestamp();
     let live: HashSet<String> = panes.iter().map(|pane| pane.pane_id.clone()).collect();
     // Built lazily: only needed when a pane that was an agent no longer reports
     // one as its foreground command, to tell an exit from a foreground subprocess.
-    let mut processes: Option<ProcessTree> = None;
+    let mut processes: Option<Arc<ProcessTree>> = None;
+    let mut raw_changed = false;
     let mut any_agent = false;
 
     for pane in &mut panes {
@@ -123,7 +263,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
             // can't be read this poll, keep the previous agent rather than clearing
             // it — a transient `ps` failure shouldn't drop a live agent to unknown.
             None => previous.agent.filter(|_| {
-                let tree = processes.get_or_insert_with(ProcessTree::snapshot);
+                let tree = processes.get_or_insert_with(ProcessTree::cached);
                 tree.is_empty() || tree.has_agent_descendant(pane.pane_pid)
             }),
         };
@@ -138,11 +278,14 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
                 };
                 detect_agent_state(agent, &evidence)
             });
+            let previous_raw = debounce.get(&pane.pane_id).map(|state| state.candidate);
+            raw_changed |= raw_sample_changed(previous, previous_raw, agent, raw);
             let pane_debounce = debounce
                 .entry(pane.pane_id.clone())
                 .or_insert_with(|| Debounce::new(raw));
             debounce_state(previous, agent, raw, pane_debounce, now)
         } else {
+            raw_changed |= previous.agent.is_some() || debounce.contains_key(&pane.pane_id);
             debounce.remove(&pane.pane_id);
             AgentStatus::unknown()
         };
@@ -152,7 +295,11 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
 
     write_window_status_icons(&panes)?;
     debounce.retain(|pane_id, _| live.contains(pane_id));
-    Ok(any_agent)
+    Ok(PollOutcome {
+        panes: live,
+        raw_changed,
+        any_agent,
+    })
 }
 
 fn current_status_daemon_pid() -> String {
@@ -181,6 +328,13 @@ fn status_daemon_process_matches(pid: &str, current_exe: &Path) -> bool {
     command.contains(" status-daemon") && command.contains(current_exe.to_string_lossy().as_ref())
 }
 
+fn executable_fingerprint(path: &Path) -> Option<String> {
+    let metadata = path.metadata().ok()?;
+    let modified = metadata.modified().ok()?;
+    let modified = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+    Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
+}
+
 fn process_exists(pid: &str) -> bool {
     Command::new("kill")
         .args(["-0", pid])
@@ -197,6 +351,24 @@ struct ProcessTree {
 }
 
 impl ProcessTree {
+    fn cached() -> Arc<Self> {
+        static CACHE: Mutex<Option<(Instant, Arc<ProcessTree>)>> = Mutex::new(None);
+
+        let mut cache = match CACHE.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((taken, tree)) = cache.as_ref() {
+            if taken.elapsed() < PROCESS_TREE_MAX_AGE {
+                return Arc::clone(tree);
+            }
+        }
+
+        let tree = Arc::new(Self::snapshot());
+        *cache = Some((Instant::now(), Arc::clone(&tree)));
+        tree
+    }
+
     fn snapshot() -> Self {
         let output = Command::new("ps")
             .args(["-Ao", "pid=,ppid=,comm="])
@@ -453,7 +625,7 @@ fn write_window_status_icons(panes: &[TmuxPane]) -> Result<()> {
         "list-windows",
         "-a",
         "-F",
-        "#{window_id}\t#{@tmux_agent_switcher_window_icon}",
+        "#{window_id}\t#{@tmux_agent_sidebar_window_icon}",
     ])?;
 
     for line in current.lines() {
@@ -488,14 +660,6 @@ fn write_window_status_icons(panes: &[TmuxPane]) -> Result<()> {
         }
     }
     Ok(())
-}
-
-pub(crate) fn mark_window_seen(window_id: &str) {
-    let output =
-        tmux_output(&["list-panes", "-t", window_id, "-F", "#{pane_id}"]).unwrap_or_default();
-    for pane_id in output.lines().filter(|line| !line.trim().is_empty()) {
-        let _ = set_pane_option(pane_id, STATUS_SEEN_OPTION, "1");
-    }
 }
 
 #[cfg(test)]
@@ -588,6 +752,60 @@ mod tests {
 
         let done = stabilize_agent_status_at(blocked, AgentKind::Codex, AgentState::Idle, 2040);
         assert_eq!(done.run_started_at, None);
+    }
+
+    #[test]
+    fn pace_uses_no_agent_interval_and_recovers_immediately() {
+        let mut pace = Pace::new();
+
+        assert_eq!(pace.after(false, false), NO_AGENT_DAEMON_INTERVAL);
+        for _ in 0..QUIET_POLLS_BEFORE_BACKOFF - 1 {
+            assert_eq!(pace.after(true, false), STATUS_DAEMON_INTERVAL);
+        }
+        assert_eq!(pace.after(true, false), IDLE_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, false), IDLE_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, true), STATUS_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, false), STATUS_DAEMON_INTERVAL);
+    }
+
+    #[test]
+    fn first_different_raw_sample_is_activity_before_debounce_commits_it() {
+        let committed = AgentStatus {
+            agent: Some(AgentKind::Claude),
+            state: AgentState::Working,
+            seen: true,
+            run_started_at: Some(1000),
+        };
+
+        assert!(raw_sample_changed(
+            committed,
+            Some(AgentState::Working),
+            AgentKind::Claude,
+            AgentState::Idle,
+        ));
+        assert!(!raw_sample_changed(
+            committed,
+            Some(AgentState::Idle),
+            AgentKind::Claude,
+            AgentState::Idle,
+        ));
+    }
+
+    #[test]
+    fn heartbeat_interval_rejects_values_that_could_create_a_busy_loop() {
+        assert_eq!(parse_tick_interval(""), DEFAULT_TICK_INTERVAL);
+        assert_eq!(parse_tick_interval("0"), DEFAULT_TICK_INTERVAL);
+        assert_eq!(parse_tick_interval("-1"), DEFAULT_TICK_INTERVAL);
+        assert_eq!(parse_tick_interval("nonsense"), DEFAULT_TICK_INTERVAL);
+        assert_eq!(parse_tick_interval(" 15 "), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn process_tree_cache_reuses_a_recent_snapshot() {
+        let first = ProcessTree::cached();
+        let second = ProcessTree::cached();
+
+        assert!(Arc::ptr_eq(&first, &second));
     }
 
     #[test]

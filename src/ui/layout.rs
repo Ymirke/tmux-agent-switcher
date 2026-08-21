@@ -73,28 +73,34 @@ pub(crate) fn switcher_layout(
         }
         ViewMode::Palette => (palette_overlay(area, show_help, line_count), area),
     };
-    // Bottom-up inside the box: search prompt at the very bottom (fzf-style),
-    // help above it, the session list on top.
     let list = inset_rect(list_overlay, FLOATING_LIST_INSET);
+    if show_help {
+        let hidden = Rect {
+            x: list.x,
+            y: list.y,
+            width: list.width,
+            height: 0,
+        };
+        let help = (list.height > 0).then_some(list);
+        return SwitcherLayout {
+            list_overlay,
+            search: hidden,
+            sessions: hidden,
+            help,
+            preview,
+        };
+    }
+
+    // Bottom-up inside the box: search prompt at the very bottom (fzf-style),
+    // with the session list above it.
     let search_height = list.height.min(SEARCH_BAR_ROWS);
     let body_height = list.height.saturating_sub(search_height);
-    let help_height = if show_help {
-        HELP_LINE_COUNT.min(body_height)
-    } else {
-        0
-    };
     let sessions = Rect {
         x: list.x,
         y: list.y,
         width: list.width,
-        height: body_height.saturating_sub(help_height),
+        height: body_height,
     };
-    let help = (help_height > 0).then_some(Rect {
-        x: list.x,
-        y: sessions.y.saturating_add(sessions.height),
-        width: list.width,
-        height: help_height,
-    });
     let search = Rect {
         x: list.x,
         y: list.y.saturating_add(body_height),
@@ -106,7 +112,7 @@ pub(crate) fn switcher_layout(
         list_overlay,
         search,
         sessions,
-        help,
+        help: None,
         preview,
     }
 }
@@ -154,11 +160,13 @@ fn palette_overlay(area: Rect, show_help: bool, line_count: usize) -> Rect {
     );
     let anchor_bottom = percentage_length(area.height, PALETTE_BOTTOM_PERCENT);
     let inset = FLOATING_LIST_INSET.saturating_mul(2);
-    let help_height = if show_help { HELP_LINE_COUNT } else { 0 };
-    // At least one body row so the "no matching windows" hint has a home.
-    let height = (line_count.max(1).min(u16::MAX as usize) as u16)
-        .saturating_add(SEARCH_BAR_ROWS)
-        .saturating_add(help_height)
+    let list_height = line_count.max(1).min(u16::MAX as usize) as u16;
+    let content_height = if show_help {
+        HELP_LINE_COUNT
+    } else {
+        list_height.saturating_add(SEARCH_BAR_ROWS)
+    };
+    let height = content_height
         .saturating_add(inset)
         .max(inset.saturating_add(1))
         .min(anchor_bottom.saturating_sub(PALETTE_TOP_MARGIN.min(anchor_bottom)))
@@ -211,7 +219,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn help_extends_modal_without_reducing_session_rows() {
+    fn help_replaces_the_sidebar_list_and_search() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -226,16 +234,17 @@ mod tests {
         assert_eq!(closed.list_overlay.y, 0);
         assert_eq!(closed.list_overlay.width, 28);
         assert_eq!(closed.list_overlay.height, 40);
-        assert_eq!(
-            open.sessions.height,
-            closed.sessions.height.saturating_sub(HELP_LINE_COUNT)
-        );
         assert_eq!(open.list_overlay, closed.list_overlay);
-        assert_eq!(open.help.unwrap().height, HELP_LINE_COUNT);
+        assert_eq!(open.sessions.height, 0);
+        assert_eq!(open.search.height, 0);
+        assert_eq!(
+            open.help,
+            Some(inset_rect(open.list_overlay, FLOATING_LIST_INSET))
+        );
     }
 
     #[test]
-    fn sidebar_right_docks_list_to_right_edge_with_preview_on_left() {
+    fn sidebar_right_places_list_at_right_edge_with_preview_on_left() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -316,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_help_extends_the_floating_box() {
+    fn palette_help_replaces_the_list_and_search() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -324,14 +333,11 @@ mod tests {
             height: 44,
         };
 
-        let closed = switcher_layout(area, false, ViewMode::Palette, 2);
         let open = switcher_layout(area, true, ViewMode::Palette, 2);
 
-        assert_eq!(
-            open.list_overlay.height,
-            closed.list_overlay.height + HELP_LINE_COUNT
-        );
-        assert_eq!(open.sessions.height, closed.sessions.height);
+        assert_eq!(open.list_overlay.height, HELP_LINE_COUNT + 4);
+        assert_eq!(open.sessions.height, 0);
+        assert_eq!(open.search.height, 0);
         assert_eq!(open.help.unwrap().height, HELP_LINE_COUNT);
     }
 

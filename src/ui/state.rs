@@ -17,7 +17,7 @@ pub enum Direction {
     Right,
 }
 
-/// Where the window list sits: docked to the left or right edge with the
+/// Where the window list sits: fixed to the left or right edge with the
 /// preview beside it (Sidebar / SidebarRight), or floating around the upper
 /// middle of the screen with the preview filling the whole screen behind it,
 /// like an editor command palette (Palette).
@@ -746,33 +746,98 @@ pub(crate) fn swap_selected_session(
     true
 }
 
-/// Swaps the selected window with its visible neighbour in the same session,
-/// keeping the selection on the moved window. Returns the swapped window ids
-/// (selected, neighbour) so the caller can mirror the move in tmux; `None`
-/// when the move would cross the session's edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WindowReorder {
+    Swap {
+        source_window_id: String,
+        target_window_id: String,
+    },
+    Move {
+        source_window_id: String,
+        target_window_id: String,
+        before_target: bool,
+    },
+}
+
+/// Moves the selected window by one visible position. A move inside a session
+/// swaps adjacent windows. A move across a session boundary changes the
+/// window's session and inserts it next to the boundary window.
 pub(crate) fn swap_selected_window(
-    sessions: &mut [SessionGroup],
+    sessions: &mut Vec<SessionGroup>,
     filtered: &mut Vec<SessionGroup>,
     state: &mut GridState,
     query: &str,
     direction: Direction,
     terminal_height: u16,
-) -> Option<(String, String)> {
-    let session = filtered.get(state.selected_row)?;
-    let target_column = match direction {
-        Direction::Down if state.selected_column + 1 < session.cards.len() => {
-            state.selected_column + 1
+) -> Option<WindowReorder> {
+    let selected_session = filtered.get(state.selected_row)?;
+    let selected_card = selected_session.cards.get(state.selected_column)?;
+    let selected_session_name = selected_session.session_name.clone();
+    let selected_id = selected_card.window_id.clone();
+
+    let (target_row, target_column) = match direction {
+        Direction::Down if state.selected_column + 1 < selected_session.cards.len() => {
+            (state.selected_row, state.selected_column + 1)
         }
-        Direction::Up if state.selected_column > 0 => state.selected_column - 1,
+        Direction::Down if state.selected_row + 1 < filtered.len() => (state.selected_row + 1, 0),
+        Direction::Up if state.selected_column > 0 => {
+            (state.selected_row, state.selected_column - 1)
+        }
+        Direction::Up if state.selected_row > 0 => {
+            let target_row = state.selected_row - 1;
+            let target_column = filtered.get(target_row)?.cards.len().checked_sub(1)?;
+            (target_row, target_column)
+        }
         _ => return None,
     };
-    let session_name = session.session_name.clone();
-    let selected_id = session.cards.get(state.selected_column)?.window_id.clone();
-    let target_id = session.cards[target_column].window_id.clone();
+    let target_session = filtered.get(target_row)?;
+    let target_session_name = target_session.session_name.clone();
+    let target_id = target_session.cards.get(target_column)?.window_id.clone();
+
+    if selected_session_name != target_session_name {
+        let source_session_index = sessions
+            .iter()
+            .position(|session| session.session_name == selected_session_name)?;
+        let source_card_index = sessions[source_session_index]
+            .cards
+            .iter()
+            .position(|card| card.window_id == selected_id)?;
+        let mut moved_card = sessions[source_session_index]
+            .cards
+            .remove(source_card_index);
+        moved_card.session_name.clone_from(&target_session_name);
+        if sessions[source_session_index].cards.is_empty() {
+            sessions.remove(source_session_index);
+        }
+
+        let target_session = sessions
+            .iter_mut()
+            .find(|session| session.session_name == target_session_name)?;
+        let target_index = target_session
+            .cards
+            .iter()
+            .position(|card| card.window_id == target_id)?;
+        let before_target = direction == Direction::Down;
+        let insert_index = if before_target {
+            target_index
+        } else {
+            target_index + 1
+        };
+        target_session.cards.insert(insert_index, moved_card);
+
+        *filtered = filter_sessions(sessions, query);
+        *state = GridState::for_window_id(filtered, &selected_id);
+        keep_compact_selection_visible(state, filtered, terminal_height);
+        return Some(WindowReorder::Move {
+            source_window_id: selected_id,
+            target_window_id: target_id,
+            before_target,
+        });
+    }
 
     let full_session = sessions
         .iter_mut()
-        .find(|session| session.session_name == session_name)?;
+        .find(|session| session.session_name == selected_session_name)?;
     let selected_index = full_session
         .cards
         .iter()
@@ -796,7 +861,10 @@ pub(crate) fn swap_selected_window(
     *filtered = filter_sessions(sessions, query);
     *state = GridState::for_window_id(filtered, &selected_id);
     keep_compact_selection_visible(state, filtered, terminal_height);
-    Some((selected_id, target_id))
+    Some(WindowReorder::Swap {
+        source_window_id: selected_id,
+        target_window_id: target_id,
+    })
 }
 
 pub(crate) fn refresh_sessions_from_cards(
@@ -846,6 +914,31 @@ pub(crate) fn refresh_sessions_from_cards(
     *sessions = next_sessions;
     *filtered = next_filtered;
     *state = next_state;
+    keep_compact_selection_visible(state, filtered, terminal_height);
+}
+
+/// Removes a closed window from the cached lists and keeps the selection on
+/// the next window in that slot, falling back to the previous one at an edge.
+pub(crate) fn remove_window_in_place(
+    sessions: &mut Vec<SessionGroup>,
+    filtered: &mut Vec<SessionGroup>,
+    state: &mut GridState,
+    window_id: &str,
+    query: &str,
+    terminal_height: u16,
+) {
+    let fallback_row = state.selected_row;
+    let fallback_column = state.selected_column;
+    let fallback_offset = state.row_offset;
+
+    for session in sessions.iter_mut() {
+        session.cards.retain(|card| card.window_id != window_id);
+    }
+    sessions.retain(|session| !session.cards.is_empty());
+
+    *filtered = filter_sessions(sessions, query);
+    *state = fallback_grid_state(filtered, fallback_row, fallback_column);
+    state.row_offset = fallback_offset;
     keep_compact_selection_visible(state, filtered, terminal_height);
 }
 
@@ -1250,7 +1343,10 @@ mod tests {
                 Direction::Down,
                 10,
             ),
-            Some(("@work-1".to_owned(), "@work-2".to_owned()))
+            Some(WindowReorder::Swap {
+                source_window_id: "@work-1".to_owned(),
+                target_window_id: "@work-2".to_owned(),
+            })
         );
 
         let names: Vec<&str> = groups[0]
@@ -1268,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn swapping_window_clamps_at_the_session_edges() {
+    fn moving_window_crosses_session_edges_and_follows_it() {
         let mut groups = group_cards_by_session(vec![
             test_card("work", "1"),
             test_card("work", "2"),
@@ -1289,7 +1385,6 @@ mod tests {
             None
         );
         state.selected_column = 1;
-        // The last window stays put instead of crossing into the next session.
         assert_eq!(
             swap_selected_window(
                 &mut groups,
@@ -1299,8 +1394,65 @@ mod tests {
                 Direction::Down,
                 10,
             ),
-            None
+            Some(WindowReorder::Move {
+                source_window_id: "@work-2".to_owned(),
+                target_window_id: "@ops-1".to_owned(),
+                before_target: true,
+            })
         );
+        assert_eq!(groups[0].cards.len(), 1);
+        assert_eq!(groups[1].cards.len(), 2);
+        assert_eq!(groups[1].cards[0].window_id, "@work-2");
+        assert_eq!(groups[1].cards[0].session_name, "ops");
+        assert_eq!(state.selected_row, 1);
+        assert_eq!(state.selected_column, 0);
+
+        assert_eq!(
+            swap_selected_window(
+                &mut groups,
+                &mut filtered,
+                &mut state,
+                "",
+                Direction::Up,
+                10,
+            ),
+            Some(WindowReorder::Move {
+                source_window_id: "@work-2".to_owned(),
+                target_window_id: "@work-1".to_owned(),
+                before_target: false,
+            })
+        );
+        assert_eq!(groups[0].cards.len(), 2);
+        assert_eq!(groups[0].cards[1].window_id, "@work-2");
+        assert_eq!(groups[0].cards[1].session_name, "work");
+        assert_eq!(state.selected_row, 0);
+        assert_eq!(state.selected_column, 1);
+    }
+
+    #[test]
+    fn moving_the_only_window_removes_the_empty_source_session() {
+        let mut groups = group_cards_by_session(vec![
+            test_card("work", "1"),
+            test_card("ops", "1"),
+            test_card("ops", "2"),
+        ]);
+        let mut filtered = groups.clone();
+        let mut state = GridState::new();
+
+        assert!(matches!(
+            swap_selected_window(
+                &mut groups,
+                &mut filtered,
+                &mut state,
+                "",
+                Direction::Down,
+                10,
+            ),
+            Some(WindowReorder::Move { .. })
+        ));
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].session_name, "ops");
+        assert_eq!(groups[0].cards[0].window_id, "@work-1");
     }
 
     #[test]

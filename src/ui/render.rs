@@ -28,7 +28,7 @@ const SEARCH_PLACEHOLDER: &str = "type to filter";
 const KEYS_PLACEHOLDER: &str = "j/k move · [n]j/k open";
 // Shown in the modal top bar; the short form fits beside "[?] Help" within
 // the narrow sidebar's width.
-const SWITCHER_NAME: &str = "agent-switcher";
+const SWITCHER_NAME: &str = "[TAS]";
 const HELP_LABEL: &str = "[?] Help";
 
 #[allow(clippy::too_many_arguments)]
@@ -57,11 +57,11 @@ pub(crate) fn draw(
     frame.render_widget(Clear, layout.list_overlay);
     frame.render_widget(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(list_borders(view))
             .style(Style::default().fg(Color::DarkGray)),
         layout.list_overlay,
     );
-    render_modal_top_bar(frame, layout.list_overlay);
+    render_list_header(frame, layout.list_overlay);
     render_search_bar(frame, layout.search, query, input);
     if sessions.is_empty() {
         render_no_matches(frame, layout.sessions);
@@ -82,6 +82,14 @@ pub(crate) fn draw(
     }
     if let Some(prompt) = prompt {
         render_prompt(frame, frame.size(), layout.list_overlay, prompt);
+    }
+}
+
+fn list_borders(view: ViewMode) -> Borders {
+    match view {
+        ViewMode::Sidebar => Borders::RIGHT,
+        ViewMode::SidebarRight => Borders::LEFT,
+        ViewMode::Palette => Borders::ALL,
     }
 }
 
@@ -571,7 +579,7 @@ fn truncate_chars(text: &str, max_width: usize) -> String {
     text.chars().take(max_width).collect()
 }
 
-fn render_modal_top_bar(frame: &mut Frame, area: Rect) {
+fn render_list_header(frame: &mut Frame, area: Rect) {
     if area.width < 4 || area.height == 0 {
         return;
     }
@@ -631,8 +639,9 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "M-j/M-k: reorder window",
         "H/L: previous/next edge",
         "↑/↓: move, C-j/C-k: open",
-        "←/→: switch session",
-        "enter/r: open/rename",
+        "h/l · ←/→: session",
+        "↵/r/x: open/rename/close",
+        "u/e: mark unread/read",
         "C-t/C-s: new win/sess",
         "C-u: clear filter",
         "esc: clear, then close",
@@ -794,7 +803,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_uses_modal_top_bar_without_bottom_status_line() {
+    fn draw_uses_sidebar_header_without_bottom_status_line() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
         let backend = TestBackend::new(100, 40);
@@ -825,13 +834,13 @@ mod tests {
             .map(|x| buffer.get(x, 39).symbol())
             .collect::<String>();
 
-        assert!(modal_top.contains("agent-switcher"));
-        assert!(!footer.contains("agent-switcher"));
+        assert!(modal_top.contains("[TAS]"));
+        assert!(!footer.contains("[TAS]"));
         assert!(!footer.contains("j/k=window"));
     }
 
     #[test]
-    fn draw_renders_shortcuts_under_sessions_when_help_is_open() {
+    fn draw_replaces_sessions_and_search_with_shortcuts_when_help_is_open() {
         let groups = group_cards_by_session(vec![test_card("work", "1")]);
         let state = GridState::new();
         let backend = TestBackend::new(100, 40);
@@ -864,7 +873,9 @@ mod tests {
 
         assert!(rendered.contains("Shortcuts"));
         assert!(rendered.contains("tab: vim / nums / search"));
-        assert!(rendered.contains("enter"));
+        assert!(rendered.contains("↵/r/x: open/rename/close"));
+        assert!(!rendered.contains("work"));
+        assert!(!rendered.contains("❯"));
     }
 
     #[test]
@@ -892,10 +903,10 @@ mod tests {
             .unwrap();
 
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer.get(0, 0).symbol(), "┌");
-        assert_eq!(buffer.get(27, 0).symbol(), "┐");
-        assert_eq!(buffer.get(0, 39).symbol(), "└");
-        assert_eq!(buffer.get(27, 39).symbol(), "┘");
+        assert_eq!(buffer.get(0, 0).symbol(), " ");
+        assert_eq!(buffer.get(27, 0).symbol(), "│");
+        assert_eq!(buffer.get(0, 39).symbol(), " ");
+        assert_eq!(buffer.get(27, 39).symbol(), "│");
         // List sits just above the bottom search bar (separator + prompt).
         assert_eq!(buffer.get(2, 34).symbol(), "w");
         assert_eq!(buffer.get(3, 35).symbol(), "0");
@@ -946,7 +957,7 @@ mod tests {
         let box_top = (22..77)
             .map(|x| buffer.get(x, 14).symbol())
             .collect::<String>();
-        assert!(box_top.contains("agent-switcher"));
+        assert!(box_top.contains("[TAS]"));
     }
 
     #[test]
@@ -1025,15 +1036,16 @@ mod tests {
                     || row.contains("M-j/M-k:")
                     || row.contains("H/L:")
                     || row.contains("C-j/C-k")
-                    || row.contains("←/→")
-                    || row.contains("enter/r:")
+                    || row.contains("h/l · ←/→")
+                    || row.contains("↵/r/x:")
+                    || row.contains("u/e: mark unread/read")
                     || row.contains("C-t/C-s:")
                     || row.contains("C-u:")
                     || row.contains("esc:")
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(help_rows.len(), 13);
+        assert_eq!(help_rows.len(), 14);
         assert!(help_rows
             .iter()
             .any(|row| row.contains("tab: vim / nums / search")));
@@ -1058,10 +1070,13 @@ mod tests {
         assert!(help_rows.iter().any(|row| row.contains("C-j/C-k: open")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("←/→: switch session")));
+            .any(|row| row.contains("h/l · ←/→: session")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("enter/r: open/rename")));
+            .any(|row| row.contains("↵/r/x: open/rename/close")));
+        assert!(help_rows
+            .iter()
+            .any(|row| row.contains("u/e: mark unread/read")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("C-t/C-s: new win/sess")));
@@ -1272,10 +1287,10 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer.get(28, 0).symbol(), "p");
         assert_eq!(buffer.get(29, 0).symbol(), "r");
-        assert_eq!(buffer.get(0, 0).symbol(), "┌");
-        assert_eq!(buffer.get(27, 0).symbol(), "┐");
-        assert_eq!(buffer.get(0, 39).symbol(), "└");
-        assert_eq!(buffer.get(27, 39).symbol(), "┘");
+        assert_eq!(buffer.get(0, 0).symbol(), " ");
+        assert_eq!(buffer.get(27, 0).symbol(), "│");
+        assert_eq!(buffer.get(0, 39).symbol(), " ");
+        assert_eq!(buffer.get(27, 39).symbol(), "│");
         assert_eq!(buffer.get(2, 32).symbol(), "w");
         assert_eq!(buffer.get(3, 33).symbol(), "0");
         assert_eq!(buffer.get(5, 33).symbol(), "○");
@@ -1284,8 +1299,40 @@ mod tests {
         let modal_top = (0..100)
             .map(|x| buffer.get(x, 0).symbol())
             .collect::<String>();
-        assert!(modal_top.contains("agent-switcher"));
+        assert!(modal_top.contains("[TAS]"));
         assert!(modal_top.contains("[?] Help"));
+    }
+
+    #[test]
+    fn draw_renders_only_a_left_border_for_the_right_sidebar() {
+        let groups = group_cards_by_session(vec![test_card("work", "1")]);
+        let state = GridState::new();
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &groups,
+                    &state,
+                    ViewMode::SidebarRight,
+                    InputMode::Search,
+                    false,
+                    "",
+                    None,
+                    None,
+                    &test_preview(),
+                    0,
+                )
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer.get(72, 0).symbol(), "│");
+        assert_eq!(buffer.get(99, 0).symbol(), " ");
+        assert_eq!(buffer.get(72, 39).symbol(), "│");
+        assert_eq!(buffer.get(99, 39).symbol(), " ");
     }
 
     #[test]

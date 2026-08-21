@@ -6,7 +6,7 @@ pub(crate) mod render;
 pub(crate) mod state;
 
 use std::{
-    io,
+    fmt, io,
     process::Command,
     time::{Duration, Instant},
 };
@@ -15,11 +15,15 @@ use anyhow::Result;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
-        MouseEventKind,
+        KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
-    execute,
+    execute, queue,
     style::force_color_output,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
 };
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
@@ -31,7 +35,10 @@ use crate::{
     model::{SessionGroup, SwitcherAction, WindowCard},
     preview::PreviewMirror,
     search::{apply_query, delete_query_word, filter_sessions},
-    tmux::{current_window_id, env_tmux_value, rename_window, swap_windows, tmux_status},
+    tmux::{
+        current_window_id, env_tmux_value, kill_window, mark_unread_for_pane, mark_window_read,
+        move_window, rename_window, swap_windows, tmux_output, tmux_status,
+    },
 };
 use layout::{compact_navigation_height, switcher_layout};
 use render::draw;
@@ -39,10 +46,10 @@ use state::{
     accept_numbered_session, compact_lines, format_input_mode, format_view_mode, handle_prompt_key,
     initial_grid_state, keep_compact_selection_visible, move_compact_selection,
     move_compact_session_edge, parse_input_mode, parse_view_mode, push_matching_movement_count,
-    push_numbered_choice, refresh_sessions_from_cards, rename_card_in_place,
-    select_compact_relative, select_key_action, swap_selected_session, swap_selected_window,
-    sync_numbered_selection, take_counted_open_motion, Direction, GridState, InputMode,
-    NumberedOpen, PromptKind, PromptState, ViewMode,
+    push_numbered_choice, refresh_sessions_from_cards, remove_window_in_place,
+    rename_card_in_place, select_compact_relative, select_key_action, swap_selected_session,
+    swap_selected_window, sync_numbered_selection, take_counted_open_motion, Direction, GridState,
+    InputMode, NumberedOpen, PromptKind, PromptState, ViewMode, WindowReorder,
 };
 
 const CARD_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
@@ -54,22 +61,97 @@ const CARD_REFRESH_INTERVAL: Duration = Duration::from_millis(300);
 /// change. A periodic full redraw self-heals within half a second.
 const FULL_REDRAW_INTERVAL: Duration = Duration::from_millis(500);
 const TUI_TICK_INTERVAL: Duration = Duration::from_millis(50);
-const VIEW_MODE_OPTION: &str = "@tmux_agent_switcher_view";
-const INPUT_MODE_OPTION: &str = "@tmux_agent_switcher_input";
+const VIEW_MODE_OPTION: &str = "@tmux_agent_sidebar_view";
+const INPUT_MODE_OPTION: &str = "@tmux_agent_sidebar_input";
+const CONFIGURED_INPUT_MODE_OPTION: &str = "@agent_sidebar_input";
 
+/// tmux's `extended-keys-format xterm` can encode Shift+letter as an xterm
+/// modifyOtherKeys sequence, which Crossterm 0.27 does not parse. Reset that
+/// mode before requesting CSI-u with alternate keys so Shift stays intact.
+#[derive(Clone, Copy, Debug)]
+struct DisableModifyOtherKeys;
+
+impl crossterm::Command for DisableModifyOtherKeys {
+    fn write_ansi(&self, output: &mut impl fmt::Write) -> fmt::Result {
+        output.write_str("\x1b[>4;0m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "modifyOtherKeys reset is not implemented for the legacy Windows API",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
+fn keyboard_enhancement_flags() -> KeyboardEnhancementFlags {
+    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+}
+
+fn window_reorder_direction(key: KeyEvent) -> Option<Direction> {
+    let alt = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META);
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if control {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down if alt => Some(Direction::Down),
+        KeyCode::Up if alt => Some(Direction::Up),
+        KeyCode::Char('j' | 'J') if alt => Some(Direction::Down),
+        KeyCode::Char('k' | 'K') if alt => Some(Direction::Up),
+        // macOS can translate Option+j/k into printable characters instead of
+        // sending an Alt modifier. Accept the standard US-layout results too.
+        KeyCode::Char('∆') => Some(Direction::Down),
+        KeyCode::Char('˚') => Some(Direction::Up),
+        _ => None,
+    }
+}
+
+fn session_reorder_direction(key: KeyEvent) -> Option<Direction> {
+    let alt_or_control = key
+        .modifiers
+        .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::CONTROL);
+    if alt_or_control {
+        return None;
+    }
+
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        KeyCode::Char('J') => Some(Direction::Down),
+        KeyCode::Char('K') => Some(Direction::Up),
+        KeyCode::Char('j') if shift => Some(Direction::Down),
+        KeyCode::Char('k') if shift => Some(Direction::Up),
+        _ => None,
+    }
+}
+
+/// Runs the sidebar and live preview inside a full-screen tmux popup.
 pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     if cards.is_empty() {
         return Ok(None);
     }
     force_color_output(true);
-
     let current_window_id = current_window_id();
 
     let mut stdout = io::stdout();
     enable_raw_mode()?;
-    // Capture the mouse so wheel scrolls drive the list instead of tmux
-    // scrolling (and redrawing) whatever sits behind the popup.
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        DisableModifyOtherKeys,
+        PushKeyboardEnhancementFlags(keyboard_enhancement_flags()),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let result = run_tui_loop(&mut terminal, cards, current_window_id.as_deref());
@@ -77,7 +159,9 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
     execute!(
         terminal.backend_mut(),
         DisableMouseCapture,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        PopKeyboardEnhancementFlags,
+        DisableModifyOtherKeys
     )?;
     terminal.show_cursor()?;
     result
@@ -85,9 +169,9 @@ pub fn run_tui(cards: Vec<WindowCard>) -> Result<Option<SwitcherAction>> {
 
 /// An initial list move to apply as soon as the switcher opens, so a key binding
 /// can drop the user straight into navigating (e.g. Ctrl+j opens moved one down).
-/// Driven by the `TMUX_AGENT_SWITCHER_INITIAL_MOVE` env var set by the launcher.
+/// Driven by the `TMUX_AGENT_SIDEBAR_INITIAL_MOVE` env var set by the launcher.
 fn initial_move_direction() -> Option<Direction> {
-    match env_tmux_value("TMUX_AGENT_SWITCHER_INITIAL_MOVE").as_deref() {
+    match env_tmux_value("TMUX_AGENT_SIDEBAR_INITIAL_MOVE").as_deref() {
         Some("down") => Some(Direction::Down),
         Some("up") => Some(Direction::Up),
         _ => None,
@@ -95,10 +179,10 @@ fn initial_move_direction() -> Option<Direction> {
 }
 
 /// The view style the switcher opens with. The launcher passes the configured
-/// (`@agent_switcher_view`) or last-toggled style via the
-/// `TMUX_AGENT_SWITCHER_VIEW` env var.
+/// (`@agent_sidebar_view`) or last-toggled style via the
+/// `TMUX_AGENT_SIDEBAR_VIEW` env var.
 fn initial_view_mode() -> ViewMode {
-    env_tmux_value("TMUX_AGENT_SWITCHER_VIEW")
+    env_tmux_value("TMUX_AGENT_SIDEBAR_VIEW")
         .as_deref()
         .and_then(parse_view_mode)
         .unwrap_or(ViewMode::Sidebar)
@@ -116,13 +200,26 @@ fn persist_view_mode(view: ViewMode) {
     ]));
 }
 
-/// The input mode the switcher opens with: the launcher passes the configured
-/// (`@agent_switcher_input`) or last-toggled mode via `TMUX_AGENT_SWITCHER_INPUT`.
+/// The input mode the sidebar opens with. A mode selected with Tab takes
+/// priority over the configured default for the rest of the tmux server life.
 fn initial_input_mode() -> InputMode {
-    env_tmux_value("TMUX_AGENT_SWITCHER_INPUT")
+    let environment_mode = env_tmux_value("TMUX_AGENT_SIDEBAR_INPUT")
         .as_deref()
-        .and_then(parse_input_mode)
-        .unwrap_or(InputMode::Keys)
+        .and_then(parse_input_mode);
+    if let Some(input) = environment_mode {
+        return input;
+    }
+
+    for option in [INPUT_MODE_OPTION, CONFIGURED_INPUT_MODE_OPTION] {
+        let Ok(value) = tmux_output(&["show-option", "-gqv", option]) else {
+            continue;
+        };
+        if let Some(input) = parse_input_mode(value.trim()) {
+            return input;
+        }
+    }
+
+    InputMode::Keys
 }
 
 /// Same stickiness as [`persist_view_mode`], for the Tab-toggled input mode.
@@ -186,7 +283,7 @@ impl SwitcherUi {
     fn navigation_height(&self, terminal_size: Rect) -> u16 {
         compact_navigation_height(
             terminal_size,
-            self.show_help,
+            false,
             self.view,
             compact_lines(&self.filtered).len(),
             self.input,
@@ -214,10 +311,8 @@ impl SwitcherUi {
         );
     }
 
-    fn toggle_help(&mut self, terminal_size: Rect) {
+    fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
-        let navigation_height = self.navigation_height(terminal_size);
-        keep_compact_selection_visible(&mut self.state, &self.filtered, navigation_height);
     }
 
     fn open_new_window_prompt(&mut self) {
@@ -259,20 +354,118 @@ impl SwitcherUi {
         );
     }
 
-    /// Moves the selected window one slot up or down within its session,
-    /// reordering the cached lists immediately and mirroring the swap in
-    /// tmux. Best-effort: if tmux rejects the swap (e.g. a window vanished),
-    /// the periodic card refresh restores tmux's real order within a beat.
+    /// Closes the selected window and patches the cached card lists so the
+    /// list stays open with the nearest remaining window selected.
+    fn close_selected_window_with<F>(&mut self, navigation_height: u16, close_window: F)
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let Some(window_id) = self
+            .state
+            .selected_card(&self.filtered)
+            .map(|card| card.window_id.clone())
+        else {
+            return;
+        };
+        if close_window(&window_id).is_err() {
+            return;
+        }
+        remove_window_in_place(
+            &mut self.sessions,
+            &mut self.filtered,
+            &mut self.state,
+            &window_id,
+            &self.query,
+            navigation_height,
+        );
+    }
+
+    /// Persists an unread marker and patches both card caches so the selected
+    /// tab changes appearance without waiting for the next card refresh.
+    fn mark_selected_unread_with<F>(&mut self, mark_unread: F)
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let Some((window_id, pane_id)) = self
+            .state
+            .selected_card(&self.filtered)
+            .map(|card| (card.window_id.clone(), card.target_pane_id.clone()))
+        else {
+            return;
+        };
+        if mark_unread(&pane_id).is_err() {
+            return;
+        }
+
+        for session in self.sessions.iter_mut().chain(self.filtered.iter_mut()) {
+            if let Some(card) = session
+                .cards
+                .iter_mut()
+                .find(|card| card.window_id == window_id)
+            {
+                card.codex_unread = true;
+            }
+        }
+    }
+
+    /// Clears every unread signal for the selected window and patches both
+    /// card caches so the change is visible without opening the tab.
+    fn mark_selected_read_with<F>(&mut self, mark_read: F)
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        let Some(window_id) = self
+            .state
+            .selected_card(&self.filtered)
+            .map(|card| card.window_id.clone())
+        else {
+            return;
+        };
+        if mark_read(&window_id).is_err() {
+            return;
+        }
+
+        for session in self.sessions.iter_mut().chain(self.filtered.iter_mut()) {
+            if let Some(card) = session
+                .cards
+                .iter_mut()
+                .find(|card| card.window_id == window_id)
+            {
+                card.codex_unread = false;
+                card.agent_status.seen = true;
+            }
+        }
+    }
+
+    /// Moves the selected window one slot, including across session boundaries.
+    /// The cache changes immediately and tmux mirrors the move. If tmux rejects
+    /// it because a window vanished, the next card refresh restores real state.
     fn move_selected_window(&mut self, direction: Direction, navigation_height: u16) {
-        if let Some((source, target)) = swap_selected_window(
+        let Some(reorder) = swap_selected_window(
             &mut self.sessions,
             &mut self.filtered,
             &mut self.state,
             &self.query,
             direction,
             navigation_height,
-        ) {
-            let _ = swap_windows(&source, &target);
+        ) else {
+            return;
+        };
+
+        match reorder {
+            WindowReorder::Swap {
+                source_window_id,
+                target_window_id,
+            } => {
+                let _ = swap_windows(&source_window_id, &target_window_id);
+            }
+            WindowReorder::Move {
+                source_window_id,
+                target_window_id,
+                before_target,
+            } => {
+                let _ = move_window(&source_window_id, &target_window_id, before_target);
+            }
         }
     }
 
@@ -304,6 +497,40 @@ impl SwitcherUi {
     /// outcome (an action to run, or None for a plain quit); `None` keeps it
     /// open.
     fn handle_key(&mut self, key: KeyEvent, terminal_size: Rect) -> Option<Option<SwitcherAction>> {
+        self.handle_key_with_window_closer(key, terminal_size, kill_window)
+    }
+
+    fn handle_key_with_window_closer<F>(
+        &mut self,
+        key: KeyEvent,
+        terminal_size: Rect,
+        close_window: F,
+    ) -> Option<Option<SwitcherAction>>
+    where
+        F: FnOnce(&str) -> Result<()>,
+    {
+        self.handle_key_with_actions(
+            key,
+            terminal_size,
+            close_window,
+            mark_unread_for_pane,
+            mark_window_read,
+        )
+    }
+
+    fn handle_key_with_actions<F, G, H>(
+        &mut self,
+        key: KeyEvent,
+        terminal_size: Rect,
+        close_window: F,
+        mark_unread: G,
+        mark_read: H,
+    ) -> Option<Option<SwitcherAction>>
+    where
+        F: FnOnce(&str) -> Result<()>,
+        G: FnOnce(&str) -> Result<()>,
+        H: FnOnce(&str) -> Result<()>,
+    {
         if let Some(active_prompt) = self.prompt.as_mut() {
             if let Some(result) = handle_prompt_key(active_prompt, key) {
                 match result {
@@ -324,9 +551,19 @@ impl SwitcherUi {
             return None;
         }
 
+        let modified_question_mark = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META);
+        if key.code == KeyCode::Char('?') && !modified_question_mark {
+            self.toggle_help();
+            return None;
+        }
+
         let navigation_height = self.navigation_height(terminal_size);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let alt = key
+            .modifiers
+            .intersects(KeyModifiers::ALT | KeyModifiers::META);
 
         // A Vim-style count survives until j/k consumes it or another digit
         // leaves it with no matching relative target.
@@ -339,6 +576,26 @@ impl SwitcherUi {
             && matches!(key.code, KeyCode::Char('j' | 'k'));
         if !keys_count_key && !keys_count_motion {
             self.movement_count = None;
+        }
+
+        if let Some(direction) = window_reorder_direction(key) {
+            self.numbered_input.clear();
+            self.move_selected_window(direction, navigation_height);
+            return None;
+        }
+        if let Some(direction) = session_reorder_direction(key) {
+            self.numbered_input.clear();
+            if swap_selected_session(
+                &mut self.sessions,
+                &mut self.filtered,
+                &mut self.state,
+                &self.query,
+                direction,
+                navigation_height,
+            ) {
+                persist_session_order(&self.sessions);
+            }
+            return None;
         }
 
         match key.code {
@@ -358,6 +615,9 @@ impl SwitcherUi {
             }
             KeyCode::Enter => {
                 if self.input == InputMode::Numbers {
+                    if self.numbered_input.is_empty() {
+                        return self.selected_action();
+                    }
                     if self.numbered_input.contains(',') {
                         if let Some(card) = sync_numbered_selection(
                             &self.numbered_input,
@@ -382,6 +642,11 @@ impl SwitcherUi {
                     return Some(Some(action));
                 }
             }
+            KeyCode::Char(' ')
+                if self.input == InputMode::Numbers && self.numbered_input.is_empty() =>
+            {
+                return self.selected_action();
+            }
             KeyCode::Tab => {
                 self.input = self.input.toggled();
                 self.numbered_input.clear();
@@ -404,15 +669,6 @@ impl SwitcherUi {
                 if self.query.pop().is_some() {
                     self.refilter(navigation_height);
                 }
-            }
-            KeyCode::Down | KeyCode::Up if alt => {
-                self.numbered_input.clear();
-                let direction = if key.code == KeyCode::Down {
-                    Direction::Down
-                } else {
-                    Direction::Up
-                };
-                self.move_selected_window(direction, navigation_height);
             }
             KeyCode::Down => {
                 self.numbered_input.clear();
@@ -454,36 +710,21 @@ impl SwitcherUi {
                 self.numbered_input.clear();
                 return self.handle_ctrl_char(ch, navigation_height);
             }
-            KeyCode::Char('j' | 'k') if alt => {
-                self.numbered_input.clear();
-                let direction = if key.code == KeyCode::Char('j') {
-                    Direction::Down
-                } else {
-                    Direction::Up
-                };
-                self.move_selected_window(direction, navigation_height);
-            }
-            KeyCode::Char('J' | 'K') => {
-                self.numbered_input.clear();
-                let direction = if key.code == KeyCode::Char('J') {
-                    Direction::Down
-                } else {
-                    Direction::Up
-                };
-                if swap_selected_session(
-                    &mut self.sessions,
-                    &mut self.filtered,
-                    &mut self.state,
-                    &self.query,
-                    direction,
-                    navigation_height,
-                ) {
-                    persist_session_order(&self.sessions);
-                }
-            }
             KeyCode::Char('r') if self.input != InputMode::Search => {
                 self.numbered_input.clear();
                 self.open_rename_prompt();
+            }
+            KeyCode::Char('x') if self.input != InputMode::Search => {
+                self.numbered_input.clear();
+                self.close_selected_window_with(navigation_height, close_window);
+            }
+            KeyCode::Char('u') if self.input == InputMode::Keys => {
+                self.numbered_input.clear();
+                self.mark_selected_unread_with(mark_unread);
+            }
+            KeyCode::Char('e') if self.input == InputMode::Keys => {
+                self.numbered_input.clear();
+                self.mark_selected_read_with(mark_read);
             }
             KeyCode::Char('j' | 'k') if self.input == InputMode::Numbers => {
                 self.numbered_input.clear();
@@ -494,6 +735,19 @@ impl SwitcherUi {
                         Direction::Down
                     } else {
                         Direction::Up
+                    },
+                    navigation_height,
+                );
+            }
+            KeyCode::Char('h' | 'l') if self.input == InputMode::Numbers => {
+                self.numbered_input.clear();
+                move_compact_selection(
+                    &mut self.state,
+                    &self.filtered,
+                    if key.code == KeyCode::Char('h') {
+                        Direction::Left
+                    } else {
+                        Direction::Right
                     },
                     navigation_height,
                 );
@@ -524,15 +778,9 @@ impl SwitcherUi {
                     );
                 }
             }
-            KeyCode::Char('?') if self.input == InputMode::Numbers => {
-                self.toggle_help(terminal_size);
-            }
             KeyCode::Char(_) if self.input == InputMode::Numbers => {}
             KeyCode::Char(ch) if self.input == InputMode::Keys => {
-                return self.handle_keys_mode_char(ch, navigation_height, terminal_size);
-            }
-            KeyCode::Char('?') if self.query.is_empty() => {
-                self.toggle_help(terminal_size);
+                return self.handle_keys_mode_char(ch, navigation_height);
             }
             KeyCode::Char(ch) => {
                 self.query.push(ch);
@@ -542,6 +790,14 @@ impl SwitcherUi {
         }
 
         None
+    }
+
+    fn selected_action(&self) -> Option<Option<SwitcherAction>> {
+        self.state
+            .selected_card(&self.filtered)
+            .cloned()
+            .map(SwitcherAction::Select)
+            .map(Some)
     }
 
     /// Ctrl-modified keys, active in every input mode.
@@ -622,12 +878,11 @@ impl SwitcherUi {
     }
 
     /// Unmodified characters in Keys (Vim) mode: motions, counts, and the
-    /// prompt/select/help shortcuts.
+    /// prompt/select shortcuts.
     fn handle_keys_mode_char(
         &mut self,
         ch: char,
         navigation_height: u16,
-        terminal_size: Rect,
     ) -> Option<Option<SwitcherAction>> {
         match ch {
             'q' => return Some(None),
@@ -636,7 +891,6 @@ impl SwitcherUi {
                     return Some(Some(SwitcherAction::Select(card.clone())));
                 }
             }
-            '?' => self.toggle_help(terminal_size),
             'n' => self.open_new_window_prompt(),
             'N' => self.open_new_session_prompt(),
             'h' => {
@@ -711,6 +965,12 @@ impl SwitcherUi {
     }
 }
 
+fn queue_full_repaint(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    queue!(terminal.backend_mut(), Clear(ClearType::All))?;
+    terminal.swap_buffers();
+    Ok(())
+}
+
 fn run_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     cards: Vec<WindowCard>,
@@ -740,7 +1000,7 @@ fn run_tui_loop(
         .preview;
         preview.refresh_for(ui.state.selected_card(&ui.filtered), preview_area, now);
         if now.duration_since(last_full_redraw) >= FULL_REDRAW_INTERVAL {
-            terminal.clear()?;
+            queue_full_repaint(terminal)?;
             last_full_redraw = now;
         }
         let spinner_frame = spinner_started_at.elapsed().as_millis() as usize / 120;
@@ -774,7 +1034,7 @@ fn run_tui_loop(
                 let navigation_height = ui.navigation_height(terminal.size()?);
                 ui.handle_mouse(mouse.kind, navigation_height);
             }
-            Event::Resize(_, _) => terminal.clear()?,
+            Event::Resize(_, _) => queue_full_repaint(terminal)?,
             Event::Key(key) => {
                 if let Some(result) = ui.handle_key(key, terminal.size()?) {
                     return Ok(result);
@@ -782,5 +1042,319 @@ fn run_tui_loop(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{cards::group_cards_by_session, test_support::test_card};
+
+    fn test_ui(input: InputMode) -> SwitcherUi {
+        let sessions = group_cards_by_session(vec![test_card("work", "1"), test_card("work", "2")]);
+        let filtered = sessions.clone();
+        let mut state = GridState::new();
+        state.selected_column = 1;
+
+        SwitcherUi {
+            sessions,
+            filtered,
+            query: String::new(),
+            state,
+            view: ViewMode::Sidebar,
+            input,
+            movement_count: None,
+            numbered_input: String::new(),
+            show_help: false,
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn shift_j_and_k_accept_both_terminal_key_encodings() {
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SHIFT,)),
+            Some(Direction::Down)
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::SHIFT,)),
+            Some(Direction::Up)
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::NONE,)),
+            Some(Direction::Down)
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE,)),
+            Some(Direction::Up)
+        );
+    }
+
+    #[test]
+    fn popup_disables_xterm_modify_other_keys() {
+        let mut ansi = String::new();
+        crossterm::Command::write_ansi(&DisableModifyOtherKeys, &mut ansi).unwrap();
+
+        assert_eq!(ansi, "\x1b[>4;0m");
+    }
+
+    #[test]
+    fn popup_requests_shifted_alternate_keys() {
+        let mut ansi = String::new();
+        crossterm::Command::write_ansi(
+            &PushKeyboardEnhancementFlags(keyboard_enhancement_flags()),
+            &mut ansi,
+        )
+        .unwrap();
+
+        assert_eq!(ansi, "\x1b[>5u");
+    }
+
+    #[test]
+    fn alt_j_and_k_match_alt_arrow_keys() {
+        for (key, direction) in [
+            (KeyCode::Char('j'), Direction::Down),
+            (KeyCode::Down, Direction::Down),
+            (KeyCode::Char('k'), Direction::Up),
+            (KeyCode::Up, Direction::Up),
+        ] {
+            assert_eq!(
+                window_reorder_direction(KeyEvent::new(key, KeyModifiers::ALT)),
+                Some(direction)
+            );
+        }
+
+        assert_eq!(
+            window_reorder_direction(KeyEvent::new(KeyCode::Char('∆'), KeyModifiers::NONE,)),
+            Some(Direction::Down)
+        );
+        assert_eq!(
+            window_reorder_direction(KeyEvent::new(KeyCode::Char('˚'), KeyModifiers::NONE,)),
+            Some(Direction::Up)
+        );
+    }
+
+    #[test]
+    fn question_mark_toggles_help_in_every_input_mode() {
+        for input in [InputMode::Keys, InputMode::Numbers, InputMode::Search] {
+            let mut ui = test_ui(input);
+            ui.query = "existing filter".to_owned();
+            let selected_window = ui
+                .state
+                .selected_card(&ui.filtered)
+                .unwrap()
+                .window_id
+                .clone();
+            let question_mark = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
+            let terminal_size = Rect::new(0, 0, 100, 40);
+            let list_height = ui.navigation_height(terminal_size);
+            let row_offset = ui.state.row_offset;
+
+            assert_eq!(ui.handle_key(question_mark, terminal_size), None);
+            assert!(ui.show_help);
+            assert_eq!(ui.query, "existing filter");
+            assert_eq!(ui.navigation_height(terminal_size), list_height);
+            assert_eq!(ui.state.row_offset, row_offset);
+            assert_eq!(
+                ui.state.selected_card(&ui.filtered).unwrap().window_id,
+                selected_window
+            );
+
+            assert_eq!(ui.handle_key(question_mark, terminal_size), None);
+            assert!(!ui.show_help);
+            assert_eq!(ui.query, "existing filter");
+            assert_eq!(ui.navigation_height(terminal_size), list_height);
+            assert_eq!(ui.state.row_offset, row_offset);
+        }
+    }
+
+    #[test]
+    fn enter_and_space_open_the_highlighted_window_in_navigation_modes() {
+        let terminal_size = Rect::new(0, 0, 100, 40);
+        for input in [InputMode::Keys, InputMode::Numbers] {
+            for key in [KeyCode::Enter, KeyCode::Char(' ')] {
+                let mut ui = test_ui(input);
+                ui.handle_key(
+                    KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                    terminal_size,
+                );
+                ui.handle_key(
+                    KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                    terminal_size,
+                );
+
+                let action = ui.handle_key(KeyEvent::new(key, KeyModifiers::NONE), terminal_size);
+                let Some(Some(SwitcherAction::Select(card))) = action else {
+                    panic!("{key:?} did not select a window in {input:?} mode");
+                };
+                assert_eq!(card.window_id, "@work-2");
+            }
+        }
+    }
+
+    #[test]
+    fn numbered_enter_keeps_resolving_a_typed_address() {
+        let mut ui = test_ui(InputMode::Numbers);
+        ui.numbered_input = "1,1".to_owned();
+
+        let action = ui.handle_key(
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            Rect::new(0, 0, 100, 40),
+        );
+        let Some(Some(SwitcherAction::Select(card))) = action else {
+            panic!("typed numbered address did not select a window");
+        };
+        assert_eq!(card.window_id, "@work-1");
+    }
+
+    #[test]
+    fn h_and_l_switch_sessions_in_navigation_modes() {
+        let sessions = group_cards_by_session(vec![test_card("work", "1"), test_card("ops", "1")]);
+        let terminal_size = Rect::new(0, 0, 100, 40);
+
+        for input in [InputMode::Keys, InputMode::Numbers] {
+            let mut ui = test_ui(input);
+            ui.sessions = sessions.clone();
+            ui.filtered = sessions.clone();
+            ui.state = GridState::new();
+
+            ui.handle_key(
+                KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE),
+                terminal_size,
+            );
+            assert_eq!(
+                ui.state.selected_card(&ui.filtered).unwrap().session_name,
+                "ops"
+            );
+
+            ui.handle_key(
+                KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+                terminal_size,
+            );
+            assert_eq!(
+                ui.state.selected_card(&ui.filtered).unwrap().session_name,
+                "work"
+            );
+        }
+    }
+
+    #[test]
+    fn x_closes_the_selected_window_without_closing_the_sidebar() {
+        for input in [InputMode::Keys, InputMode::Numbers] {
+            let mut ui = test_ui(input);
+
+            assert_eq!(
+                ui.handle_key_with_window_closer(
+                    KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                    Rect::new(0, 0, 100, 40),
+                    |window_id| {
+                        assert_eq!(window_id, "@work-2");
+                        Ok(())
+                    },
+                ),
+                None
+            );
+            assert_eq!(ui.sessions[0].cards.len(), 1);
+            assert_eq!(
+                ui.state.selected_card(&ui.filtered).unwrap().window_id,
+                "@work-1"
+            );
+        }
+    }
+
+    #[test]
+    fn x_remains_query_text_in_search_mode() {
+        let mut ui = test_ui(InputMode::Search);
+
+        assert_eq!(
+            ui.handle_key_with_window_closer(
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+                Rect::new(0, 0, 100, 40),
+                |_| panic!("search input must not close a window"),
+            ),
+            None
+        );
+        assert_eq!(ui.query, "x");
+    }
+
+    #[test]
+    fn u_marks_the_selected_tab_unread_in_vim_mode() {
+        let mut ui = test_ui(InputMode::Keys);
+        let mut marked_pane = None;
+
+        assert_eq!(
+            ui.handle_key_with_actions(
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+                Rect::new(0, 0, 100, 40),
+                |_| panic!("u must not close a window"),
+                |pane_id| {
+                    marked_pane = Some(pane_id.to_owned());
+                    Ok(())
+                },
+                |_| panic!("u must not mark a window read"),
+            ),
+            None
+        );
+
+        assert_eq!(marked_pane.as_deref(), Some("%work-2"));
+        assert!(ui.sessions[0].cards[1].codex_unread);
+        assert!(ui.filtered[0].cards[1].codex_unread);
+    }
+
+    #[test]
+    fn u_keeps_its_existing_behavior_outside_vim_mode() {
+        let terminal_size = Rect::new(0, 0, 100, 40);
+
+        let mut numbers = test_ui(InputMode::Numbers);
+        numbers.handle_key_with_actions(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            terminal_size,
+            |_| panic!("u must not close a window"),
+            |_| panic!("u must not mark unread in number mode"),
+            |_| panic!("u must not mark read in number mode"),
+        );
+        assert!(!numbers.filtered[0].cards[1].codex_unread);
+
+        let mut search = test_ui(InputMode::Search);
+        search.handle_key_with_actions(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+            terminal_size,
+            |_| panic!("u must not close a window"),
+            |_| panic!("u must remain query text in search mode"),
+            |_| panic!("u must remain query text in search mode"),
+        );
+        assert_eq!(search.query, "u");
+    }
+
+    #[test]
+    fn e_marks_the_selected_tab_read_in_vim_mode() {
+        let mut ui = test_ui(InputMode::Keys);
+        for session in [&mut ui.sessions, &mut ui.filtered] {
+            let card = &mut session[0].cards[1];
+            card.codex_unread = true;
+            card.agent_status =
+                crate::model::AgentStatus::done(Some(crate::model::AgentKind::Codex));
+        }
+        let mut marked_window = None;
+
+        assert_eq!(
+            ui.handle_key_with_actions(
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+                Rect::new(0, 0, 100, 40),
+                |_| panic!("e must not close a window"),
+                |_| panic!("e must not mark a pane unread"),
+                |window_id| {
+                    marked_window = Some(window_id.to_owned());
+                    Ok(())
+                },
+            ),
+            None
+        );
+
+        assert_eq!(marked_window.as_deref(), Some("@work-2"));
+        assert!(!ui.sessions[0].cards[1].codex_unread);
+        assert!(ui.sessions[0].cards[1].agent_status.seen);
+        assert!(!ui.filtered[0].cards[1].codex_unread);
+        assert!(ui.filtered[0].cards[1].agent_status.seen);
     }
 }
