@@ -8,6 +8,7 @@
 #   set -g @agent_sidebar_key 'C-n'       # global popup opener (default C-n)
 #   set -g @agent_sidebar_nav 'on'        # vim-aware C-h/C-j/C-k/C-l navigation
 #   set -g @agent_sidebar_tab_status 'on' # agent indicator in window tabs
+#   set -g @agent_sidebar_daemon_autostart 'off' # start daemon at plugin load
 set -euo pipefail
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,6 +42,7 @@ fi
 open_key="$(tmux_option_allow_empty @agent_sidebar_key C-n)"
 nav="$(tmux_option @agent_sidebar_nav on)"
 tab_status="$(tmux_option @agent_sidebar_tab_status on)"
+daemon_autostart="$(tmux_option @agent_sidebar_daemon_autostart off)"
 
 configure_tab_status() {
   local option="$1"
@@ -57,6 +59,12 @@ configure_tab_status() {
 
 configure_tab_status window-status-format
 configure_tab_status window-status-current-format
+
+# Start the daemon before the first sidebar opens. The background launcher
+# prevents a first download or build from blocking the tmux configuration.
+if [[ "$daemon_autostart" == "on" ]]; then
+  tmux run-shell -b "exec '$CURRENT_DIR/bin/tmux-agent-sidebar' status-daemon"
+fi
 
 remove_persistent_sidebar() {
   local pane window_id saved_layout

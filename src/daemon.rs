@@ -24,6 +24,7 @@ use crate::{
 };
 
 const STATUS_DAEMON_INTERVAL: Duration = Duration::from_millis(300);
+const NO_AGENT_DAEMON_INTERVAL: Duration = Duration::from_secs(2);
 const STATUS_DAEMON_OWNERSHIP_CHECK_POLLS: u32 = 10;
 const STATUS_CAPTURE_LINES: usize = 25;
 /// Consecutive idle polls required before committing a Working/Blocked -> Idle
@@ -36,6 +37,7 @@ const IDLE_DEBOUNCE_POLLS: u32 = 4;
 pub(crate) const BUSY_DEBOUNCE_POLLS: u32 = 2;
 const STATUS_DAEMON_PID_OPTION: &str = "@tmux_agent_sidebar_status_daemon_pid";
 const STATUS_DAEMON_BUILD_OPTION: &str = "@tmux_agent_sidebar_status_daemon_build";
+const STATUS_DAEMON_CLAIM_LOCK: &str = "tmux-agent-sidebar-status-daemon-claim";
 const STATUS_AGENT_OPTION: &str = "@tmux_agent_sidebar_agent";
 const STATUS_STATE_OPTION: &str = "@tmux_agent_sidebar_state";
 pub(crate) const STATUS_SEEN_OPTION: &str = "@tmux_agent_sidebar_seen";
@@ -67,12 +69,7 @@ pub fn ensure_status_daemon() -> Result<()> {
     drop(last_check);
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
-    let pid = current_status_daemon_pid();
-    let running_current_build = executable_fingerprint(&current_exe)
-        .map(|fingerprint| tmux_option(STATUS_DAEMON_BUILD_OPTION) == fingerprint)
-        .unwrap_or(true);
-    if !pid.is_empty() && running_current_build && status_daemon_process_matches(&pid, &current_exe)
-    {
+    if status_daemon_is_current(&current_exe) {
         return Ok(());
     }
 
@@ -92,7 +89,12 @@ impl Pace {
         Self { quiet_polls: 0 }
     }
 
-    fn after(&mut self, changed: bool) -> Duration {
+    fn after(&mut self, any_agent: bool, changed: bool) -> Duration {
+        if !any_agent {
+            self.quiet_polls = 0;
+            return NO_AGENT_DAEMON_INTERVAL;
+        }
+
         if changed {
             self.quiet_polls = 0;
             return STATUS_DAEMON_INTERVAL;
@@ -150,9 +152,30 @@ fn tmux_option(name: &str) -> String {
         .to_owned()
 }
 
+struct StatusDaemonClaimLock;
+
+impl StatusDaemonClaimLock {
+    fn acquire() -> Result<Self> {
+        tmux_status(Command::new("tmux").args(["wait-for", "-L", STATUS_DAEMON_CLAIM_LOCK]))?;
+        Ok(Self)
+    }
+}
+
+impl Drop for StatusDaemonClaimLock {
+    fn drop(&mut self) {
+        let _ =
+            tmux_status(Command::new("tmux").args(["wait-for", "-U", STATUS_DAEMON_CLAIM_LOCK]));
+    }
+}
+
 pub fn run_status_daemon() -> Result<()> {
-    let pid = std::process::id().to_string();
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    let claim_lock = StatusDaemonClaimLock::acquire()?;
+    if status_daemon_is_current(&current_exe) {
+        return Ok(());
+    }
+
+    let pid = std::process::id().to_string();
     let fingerprint = executable_fingerprint(&current_exe).unwrap_or_default();
     tmux_status(Command::new("tmux").args([
         "set-option",
@@ -167,6 +190,7 @@ pub fn run_status_daemon() -> Result<()> {
         STATUS_DAEMON_BUILD_OPTION,
         &fingerprint,
     ]))?;
+    drop(claim_lock);
 
     let mut debounce: HashMap<String, Debounce> = HashMap::new();
     let mut ownership_check = 0;
@@ -185,7 +209,7 @@ pub fn run_status_daemon() -> Result<()> {
         let pane_set_changed = previous_panes.as_ref() != Some(&outcome.panes);
         previous_panes = Some(outcome.panes);
         tick.run_if_due();
-        thread::sleep(pace.after(outcome.raw_changed || pane_set_changed));
+        thread::sleep(pace.after(outcome.any_agent, outcome.raw_changed || pane_set_changed));
     }
 
     if current_status_daemon_pid() == pid {
@@ -213,6 +237,7 @@ pub fn poll_agent_status_once(debounce: &mut HashMap<String, Debounce>) -> Resul
 struct PollOutcome {
     panes: HashSet<String>,
     raw_changed: bool,
+    any_agent: bool,
 }
 
 fn raw_sample_changed(
@@ -243,6 +268,7 @@ fn poll_agent_status_once_with_activity(
     // one as its foreground command, to tell an exit from a foreground subprocess.
     let mut processes: Option<Arc<ProcessTree>> = None;
     let mut raw_changed = false;
+    let mut any_agent = false;
 
     for pane in &mut panes {
         let previous = pane.agent_status;
@@ -260,6 +286,7 @@ fn poll_agent_status_once_with_activity(
             }),
         };
         let next = if let Some(agent) = agent {
+            any_agent = true;
             let raw = detect_agent_state_from_title(agent, &pane.pane_title).unwrap_or_else(|| {
                 let evidence = AgentEvidence {
                     screen_tail: capture_pane_tail(&pane.pane_id, STATUS_CAPTURE_LINES),
@@ -289,6 +316,7 @@ fn poll_agent_status_once_with_activity(
     Ok(PollOutcome {
         panes: live,
         raw_changed,
+        any_agent,
     })
 }
 
@@ -297,6 +325,14 @@ fn current_status_daemon_pid() -> String {
         .unwrap_or_default()
         .trim()
         .to_owned()
+}
+
+fn status_daemon_is_current(current_exe: &Path) -> bool {
+    let pid = current_status_daemon_pid();
+    let running_current_build = executable_fingerprint(current_exe)
+        .map(|fingerprint| tmux_option(STATUS_DAEMON_BUILD_OPTION) == fingerprint)
+        .unwrap_or(true);
+    !pid.is_empty() && running_current_build && status_daemon_process_matches(&pid, current_exe)
 }
 
 fn status_daemon_process_matches(pid: &str, current_exe: &Path) -> bool {
@@ -745,16 +781,17 @@ mod tests {
     }
 
     #[test]
-    fn pace_backs_off_at_twenty_quiet_samples_and_recovers_immediately() {
+    fn pace_uses_no_agent_interval_and_recovers_immediately() {
         let mut pace = Pace::new();
 
+        assert_eq!(pace.after(false, false), NO_AGENT_DAEMON_INTERVAL);
         for _ in 0..QUIET_POLLS_BEFORE_BACKOFF - 1 {
-            assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+            assert_eq!(pace.after(true, false), STATUS_DAEMON_INTERVAL);
         }
-        assert_eq!(pace.after(false), IDLE_DAEMON_INTERVAL);
-        assert_eq!(pace.after(false), IDLE_DAEMON_INTERVAL);
-        assert_eq!(pace.after(true), STATUS_DAEMON_INTERVAL);
-        assert_eq!(pace.after(false), STATUS_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, false), IDLE_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, false), IDLE_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, true), STATUS_DAEMON_INTERVAL);
+        assert_eq!(pace.after(true, false), STATUS_DAEMON_INTERVAL);
     }
 
     #[test]

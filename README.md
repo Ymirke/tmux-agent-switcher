@@ -112,6 +112,7 @@ set -g @agent_sidebar_nav 'on'           # Vim-aware C-h/C-j/C-k/C-l navigation
 set -g @agent_sidebar_view 'sidebar'     # sidebar, sidebar-right, or palette
 set -g @agent_sidebar_input 'keys'       # keys, numbers, or search
 set -g @agent_sidebar_tab_status 'on'    # agent state icons in tmux window tabs
+set -g @agent_sidebar_daemon_autostart 'off' # start the daemon at plugin load
 set -g @agent_sidebar_tick_command ''    # optional daemon heartbeat command
 set -g @agent_sidebar_tick_interval '60' # heartbeat interval in seconds
 ```
@@ -126,6 +127,10 @@ Set `@agent_sidebar_nav` to `off` if you use the navigation keys for another
 purpose. Set `@agent_sidebar_tab_status` to `off` to keep the current tmux
 window formats unchanged.
 
+Set `@agent_sidebar_daemon_autostart` to `on` to publish agent status before
+the first sidebar opens. The daemon starts in the background, so a download or
+build does not block the tmux configuration.
+
 The daemon starts the heartbeat command with `sh -c`. The heartbeat does not
 block status polling. Invalid intervals use 60 seconds.
 
@@ -137,9 +142,10 @@ The plugin reads these sources:
 - visible pane text from `tmux capture-pane`;
 - a cached `ps` process-tree snapshot.
 
-The daemon polls every 300 milliseconds while pane state changes. After 20
-unchanged polls, the interval changes to one second. A state change restores
-the 300 millisecond interval.
+The daemon polls every two seconds when no pane has an agent. When an agent is
+present, the daemon polls every 300 milliseconds while pane state changes.
+After 20 unchanged polls, the interval changes to one second. A state change
+restores the 300 millisecond interval.
 
 The daemon stores pane and window state in tmux options. The sidebar and tmux
 status line read these options without a new process scan.
