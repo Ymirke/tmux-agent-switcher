@@ -127,6 +127,8 @@ fn session_reorder_direction(key: KeyEvent) -> Option<Direction> {
 
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
     match key.code {
+        KeyCode::Down if shift => Some(Direction::Down),
+        KeyCode::Up if shift => Some(Direction::Up),
         KeyCode::Char('J') => Some(Direction::Down),
         KeyCode::Char('K') => Some(Direction::Up),
         KeyCode::Char('j') if shift => Some(Direction::Down),
@@ -1071,7 +1073,23 @@ mod tests {
     }
 
     #[test]
-    fn shift_j_and_k_accept_both_terminal_key_encodings() {
+    fn shifted_vim_and_arrow_keys_reorder_sessions() {
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT,)),
+            Some(Direction::Down)
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT,)),
+            Some(Direction::Up)
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE,)),
+            None
+        );
+        assert_eq!(
+            session_reorder_direction(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE,)),
+            None
+        );
         assert_eq!(
             session_reorder_direction(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SHIFT,)),
             Some(Direction::Down)
@@ -1088,6 +1106,32 @@ mod tests {
             session_reorder_direction(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::NONE,)),
             Some(Direction::Up)
         );
+    }
+
+    #[test]
+    fn plain_arrow_keys_navigate_like_j_and_k() {
+        let terminal_size = Rect::new(0, 0, 100, 40);
+
+        for (arrow, vim, starting_column) in [(KeyCode::Down, 'j', 0), (KeyCode::Up, 'k', 1)] {
+            let mut arrow_ui = test_ui(InputMode::Keys);
+            arrow_ui.state.selected_column = starting_column;
+            let mut vim_ui = test_ui(InputMode::Keys);
+            vim_ui.state.selected_column = starting_column;
+
+            assert_eq!(
+                arrow_ui.handle_key(KeyEvent::new(arrow, KeyModifiers::NONE), terminal_size),
+                None
+            );
+            assert_eq!(
+                vim_ui.handle_key(
+                    KeyEvent::new(KeyCode::Char(vim), KeyModifiers::NONE),
+                    terminal_size,
+                ),
+                None
+            );
+            assert_eq!(arrow_ui.state, vim_ui.state);
+            assert_eq!(arrow_ui.sessions, vim_ui.sessions);
+        }
     }
 
     #[test]

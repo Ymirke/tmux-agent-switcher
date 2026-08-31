@@ -635,10 +635,10 @@ fn render_help(frame: &mut Frame, area: Rect) {
         "S-tab: palette/sidebar",
         "nums: session → window",
         "vim: j/k · [n]j/k open",
-        "S-j/S-k: reorder session",
+        "S-j/k · S-↑/↓: session",
         "M-j/M-k: reorder window",
         "H/L: previous/next edge",
-        "↑/↓: move, C-j/C-k: open",
+        "j/k: move, C-j/C-k: open",
         "h/l · ←/→: session",
         "↵/r/x: open/rename/close",
         "u/e: mark unread/read",
@@ -1032,7 +1032,7 @@ mod tests {
                     || row.contains("search:")
                     || row.contains("nums:")
                     || row.contains("vim:")
-                    || row.contains("S-j/S-k:")
+                    || row.contains("S-j/k · S-↑/↓:")
                     || row.contains("M-j/M-k:")
                     || row.contains("H/L:")
                     || row.contains("C-j/C-k")
@@ -1060,7 +1060,7 @@ mod tests {
             .any(|row| row.contains("vim: j/k · [n]j/k open")));
         assert!(help_rows
             .iter()
-            .any(|row| row.contains("S-j/S-k: reorder session")));
+            .any(|row| row.contains("S-j/k · S-↑/↓: session")));
         assert!(help_rows
             .iter()
             .any(|row| row.contains("M-j/M-k: reorder window")));

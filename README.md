@@ -82,7 +82,8 @@ Inside the sidebar, Vim input mode is the default:
 
 - Use <kbd>j</kbd> and <kbd>k</kbd> to move the selection.
 - Use a count such as <kbd>10j</kbd> or <kbd>10k</kbd> to open a relative window.
-- Use <kbd>Shift</kbd>+<kbd>j/k</kbd> to move the selected session.
+- Use <kbd>Shift</kbd>+<kbd>j/k</kbd> or <kbd>Shift</kbd>+<kbd>↑/↓</kbd> to move
+  the selected session.
 - Use <kbd>Alt</kbd>+<kbd>j/k</kbd> or <kbd>Alt</kbd>+<kbd>↑/↓</kbd> to move a
   window. A window moves into the next session when it crosses a session edge.
 - Press <kbd>Enter</kbd> to open the selected window.
